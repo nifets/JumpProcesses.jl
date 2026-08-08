@@ -156,6 +156,7 @@ function DiffEqBase.solve!(integrator::SSAIntegrator)
     # if the user terminated the solve we shouldn't advance in time any more
     if integrator.sol.retcode !== ReturnCode.Terminated
         integrator.t = end_time
+        advance_to!(integrator, integrator.cb.condition, end_time)
 
         # check callbacks one last time
         if !(integrator.opts.callback.discrete_callbacks isa Tuple{})
@@ -355,6 +356,10 @@ function DiffEqBase.add_tstop!(integrator::SSAIntegrator, tstop)
         end
 
         Base.insert!(integrator.tstops, insert_index, tstop)
+
+        if tstop < integrator.tstop
+            revise_next_jump_time!(integrator, integrator.cb.condition, tstop)
+        end
     end
     nothing
 end
@@ -378,6 +383,7 @@ function DiffEqBase.step!(integrator::SSAIntegrator)
        integrator.tstops[integrator.tstops_idx] < next_jump_time
         integrator.t = integrator.tstops[integrator.tstops_idx]
         integrator.tstops_idx += 1
+        advance_to!(integrator, integrator.cb.condition, integrator.t)
     else
         integrator.t = integrator.tstop
         doaffect = true # delay effect until after saveat
@@ -387,6 +393,7 @@ function DiffEqBase.step!(integrator::SSAIntegrator)
         # Split to help prediction
         while integrator.cur_saveat < length(integrator.saveat) &&
             integrator.saveat[integrator.cur_saveat] < integrator.t
+            advance_to!(integrator, integrator.cb.condition, integrator.saveat[integrator.cur_saveat])
             saved = true
             push!(integrator.sol.t, integrator.saveat[integrator.cur_saveat])
             push!(integrator.sol.u, copy(integrator.u))

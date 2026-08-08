@@ -106,6 +106,9 @@ export Coevolve
 include("aggregators/ccnrm.jl")
 export CCNRM
 
+include("aggregators/tausplitting.jl")
+export TauSplitting
+
 include("aggregators/aggregated_api.jl")
 
 # variable rate aggregators (i.e. SSAs)
@@ -156,7 +159,7 @@ export init, solve, solve!
 include("SSA_stepper.jl")
 export SSAStepper
 
-# leaping: 
+# leaping:
 include("simple_regular_solve.jl")
 export SimpleTauLeaping, SimpleExplicitTauLeaping, EnsembleGPUKernel
 

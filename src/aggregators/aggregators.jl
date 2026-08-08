@@ -175,6 +175,13 @@ struct DirectCRDirect <: AbstractAggregatorAlgorithm end
 const JUMP_AGGREGATORS = (Direct(), DirectFW(), DirectCR(), SortingDirect(), RSSA(), FRM(),
     FRMFW(), NRM(), RSSACR(), RDirect(), Coevolve(), CCNRM())
 
+"""
+The Tau Splitting algorithm
+
+Ron Solan and Gad Getz, An exact tau-leaping method (2025). doi: 10.48550/arXiv.2509.12631
+"""
+struct TauSplitting <: AbstractAggregatorAlgorithm end
+
 # For JumpProblem construction without an aggregator
 struct NullAggregator <: AbstractAggregatorAlgorithm end
 
@@ -213,6 +220,7 @@ needs_depgraph(aggregator::NRM) = true
 needs_depgraph(aggregator::CCNRM) = true
 needs_depgraph(aggregator::RDirect) = true
 needs_depgraph(aggregator::Coevolve) = true
+needs_depgraph(aggregator::TauSplitting) = true
 
 # true if aggregator requires a map from solution variable to dependent jumps.
 # It is implicitly assumed these aggregators also require the reverse map, from
@@ -244,6 +252,7 @@ needs_vartojumps_map(Direct()) == false
 needs_vartojumps_map(aggregator::AbstractAggregatorAlgorithm) = false
 needs_vartojumps_map(aggregator::RSSA) = true
 needs_vartojumps_map(aggregator::RSSACR) = true
+needs_vartojumps_map(aggregator::TauSplitting) = true
 
 # true if aggregator supports variable rates
 supports_variablerates(aggregator::AbstractAggregatorAlgorithm) = false
