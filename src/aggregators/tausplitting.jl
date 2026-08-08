@@ -86,7 +86,7 @@ Turn a left sibling node into a right sibling node due for processing
     nothing
 end
 
-mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, U} <:
+mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, U} <:
                AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     next_jump::Int     # not used
     prev_jump::Int     # not used
@@ -104,6 +104,7 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, U} <
     vartojumps_map::VJMAP
     spec_to_writer_rxs::Vector{Vector{Int}}
     rx_to_reader_specs::Vector{Vector{Int}}
+    propensity_bounds::PB
     prev_jump_time::T
     ulow::U
     uhigh::U
@@ -117,7 +118,7 @@ end
 
 function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::Nothing,
     maj::S, rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG;
-    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, jumptostoich_map = nothing, max_interval = typemax(T), kwargs...) where {T,S,F1,F2,RNG,U}
+    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, jumptostoich_map = nothing, max_interval = typemax(T), propensity_bounds=IncreasingBounds(), kwargs...) where {T,S,F1,F2,RNG,U}
 
     numspec = length(u)
     numrxs = get_num_majumps(maj) + length(rs)
@@ -174,8 +175,10 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
         push!(rx_to_reader_specs[rx], spec)
     end
 
+    pb = propensity_bounds
+
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, njt, similar(u), similar(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, pb, njt, similar(u), similar(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
@@ -445,10 +448,10 @@ end
 
 @inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, params, t)
     # C1
-    jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
+    jump_upper_bound(p.propensity_bounds, rx.idx, p.ulow, p.uhigh, p.ma_jumps, p.rates, params, t) < rx.rate_high || return false
     # C2
     lower_state!(p, rx) && return false
-    return rx.rate_low <= jump_rate(p, rx.idx, p.ulow_rx, params, t)
+    return rx.rate_low <= jump_lower_bound(p.propensity_bounds, rx.idx, p.ulow, p.uhigh, p.ma_jumps, p.rates, params, t)
 end
 
 # because an inactive reaction's count is not accounted for in the state `u` during a node's processing, we must ensure its dependents are stable:

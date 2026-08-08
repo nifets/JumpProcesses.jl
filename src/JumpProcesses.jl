@@ -83,6 +83,9 @@ export SortingDirect
 include("aggregators/nrm.jl")
 export NRM
 
+include("aggregators/propensity_bounds.jl")
+export IncreasingBounds, MonotoneBounds, DirectionalBounds, ExplicitBounds
+
 include("aggregators/bracketing.jl")
 export BracketData
 
