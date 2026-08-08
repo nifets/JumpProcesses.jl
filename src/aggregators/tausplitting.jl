@@ -100,11 +100,14 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, U} <
     save_positions::Tuple{Bool, Bool}
     rng::RNG
     dep_gr::DEPGR
+    jumptostoich_map::Vector{Vector{Pair{Int, Int}}}
     vartojumps_map::VJMAP
     spec_to_writer_rxs::Vector{Vector{Int}}
+    rx_to_reader_specs::Vector{Vector{Int}}
     prev_jump_time::T
     ulow::U
     uhigh::U
+    ulow_scratch::U
     nodes::Vector{TauSplittingNode{T}}
     num_unstable_by_spec::Vector{Int} # how many reactions are unstable for each reactant
     rx_inactive_node::Vector{Int}     # 0 if active
@@ -114,7 +117,7 @@ end
 
 function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::Nothing,
     maj::S, rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG;
-    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, max_interval = typemax(T), kwargs...) where {T,S,F1,F2,RNG,U}
+    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, jumptostoich_map = nothing, max_interval = typemax(T), kwargs...) where {T,S,F1,F2,RNG,U}
 
     numspec = length(u)
     numrxs = get_num_majumps(maj) + length(rs)
@@ -127,6 +130,17 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
         end
     else
         dg = dep_graph
+    end
+
+    stochtype = Vector{Vector{Pair{Int, Int}}}
+    if jumptostoich_map === nothing
+        isempty(rs) ||
+            error("To use ConstantRateJumps with the TauSplitting algorithm a map from jumps to their net stoichiometry must be supplied (via `jumptostoich_map`).")
+        jtos_map = stochtype()
+    else
+        length(jumptostoich_map) == length(rs) ||
+            error("`jumptostoich_map` must have one entry per ConstantRateJump (got $(length(jumptostoich_map)) for $(length(rs)) jumps.")
+        jtos_map = convert(stochtype, jumptostoich_map)
     end
 
     if vartojumps_map === nothing
@@ -155,8 +169,13 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
         push!(spec_to_writer_rxs[spec], rx)
     end
 
+    rx_to_reader_specs = [Int[] for _ in 1:numrxs]
+    for (spec, rxs) in pairs(vtoj_map), rx in rxs
+        push!(rx_to_reader_specs[rx], spec)
+    end
+
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, vtoj_map, spec_to_writer_rxs, njt, similar(u), similar(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, njt, similar(u), similar(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
@@ -236,8 +255,8 @@ function process_node!(p::TauSplittingJumpAggregation, depth, integrator, params
                 else
                     if p.num_unstable_by_spec[spec] == 0
                         for rxj in p.spec_to_writer_rxs[spec]
-                            rx = reactivate!(p, rxj, depth, integrator)
-                            rx === nothing || add_slack!(p, rx)
+                            finalrx = reactivate!(p, rxj, depth, integrator)
+                            finalrx === nothing || add_slack!(p, finalrx)
                         end
                     end
                     p.num_unstable_by_spec[spec] += 1
@@ -364,8 +383,13 @@ function init_node!(p::TauSplittingJumpAggregation{T}, depth, t0, Δt) where {T}
     node
 end
 
-@inline jump_inputs(p, rxidx) = (spec for (spec, _) in p.ma_jumps.reactant_stoch[rxidx])
-@inline jump_outputs(p, rxidx) = (spec for (spec, _) in p.ma_jumps.net_stoch[rxidx])
+@inline function net_stoch(p, rxidx)
+    nummaj = get_num_majumps(p.ma_jumps)
+    @inbounds rxidx <= nummaj ? p.ma_jumps.net_stoch[rxidx] : p.jumptostoich_map[rxidx - nummaj]
+end
+
+@inline jump_inputs(p, rxidx) = p.rx_to_reader_specs[rxidx]
+@inline jump_outputs(p, rxidx) = (spec for (spec, _) in net_stoch(p, rxidx))
 
 @inline num_rxs(p) = get_num_majumps(p.ma_jumps) + length(p.rates)
 
@@ -375,7 +399,7 @@ end
 end
 
 @inline function add_net_stoch!(p, dest, rx)
-    @inbounds for (spec, stoch) in p.ma_jumps.net_stoch[rx.idx]
+    @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
         dest[spec] += rx.count * stoch
     end
     nothing
@@ -384,7 +408,7 @@ end
 @inline function change_slack!(p::TauSplittingJumpAggregation, rx::ReactionEntry, sign)
     (; ulow, uhigh) = p
     e = rx.count
-    @inbounds for (spec, stoch) in p.ma_jumps.net_stoch[rx.idx]
+    @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
         if stoch > 0
             uhigh[spec] += e * stoch * sign
         else
@@ -397,33 +421,27 @@ end
 @inline add_slack!(p, rx) = change_slack!(p, rx, 1)
 @inline remove_slack!(p, rx) = change_slack!(p, rx, -1)
 
-struct LowerState{T, V <: AbstractVector{T}, S, D} <: AbstractVector{T}
-    ulow::V
-    negstoch::S
-    δ::D
-end
-Base.IndexStyle(::Type{<:LowerState}) = IndexLinear()
-Base.size(s::LowerState) = size(s.ulow)
-@inline function Base.getindex(s::LowerState, k::Int)
-    v = s.ulow[k]
-    @inbounds for (spec, stoch) in s.negstoch
-        spec == k && stoch < 0 && (v -= s.δ * stoch)
-    end
-    return max(v, zero(v))
-end
 
 """
 compute a reaction specific lower bound that is tighter than `p.ulow`
 """
-function lower_state(p::TauSplittingJumpAggregation, rx::ReactionEntry)
-    LowerState(p.ulow, p.ma_jumps.net_stoch[rx.idx], min(rx.count, 1))
+@inline function lower_state!(p::TauSplittingJumpAggregation, rx::ReactionEntry)
+    v = p.ulow_scratch
+    @inbounds for spec in jump_inputs(p, rx.idx)
+        v[spec] = p.ulow[spec]
+    end
+    δ = min(rx.count, 1)
+    @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
+        stoch < 0 && (v[spec] = max(p.ulow[spec] - δ * stoch, zero(eltype(v))))
+    end
+    v
 end
 
 @inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, params, t)
     # C1
     jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
     # C2
-    ulow_rx = lower_state(p, rx)
+    ulow_rx = lower_state!(p, rx)
     return rx.rate_low <= jump_rate(p, rx.idx, ulow_rx, params, t)
 end
 
