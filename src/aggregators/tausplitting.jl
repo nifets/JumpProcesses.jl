@@ -109,6 +109,7 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, 
     ulow::U
     uhigh::U
     ulow_rx::U
+    uhigh_rx::U
     nodes::Vector{TauSplittingNode{T}}
     num_unstable_by_spec::Vector{Int} # how many reactions are unstable for each reactant
     rx_inactive_node::Vector{Int}     # 0 if active
@@ -178,7 +179,7 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
     pb = propensity_bounds
 
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, pb, njt, similar(u), similar(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, pb, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
@@ -424,34 +425,81 @@ end
 @inline add_slack!(p, rx) = change_slack!(p, rx, 1)
 @inline remove_slack!(p, rx) = change_slack!(p, rx, -1)
 
+@inline function lower_state!(
+    p::TauSplittingJumpAggregation,
+    rx::ReactionEntry,
+    pb::DirectionalBounds,
+)
+    δ = min(rx.count, 1)
+    neg = false
+
+    crx = rx.idx - get_num_majumps(p.ma_jumps)
+    @inbounds for (spec, direction) in pb.dirs[crx]
+        low = p.ulow[spec]
+        high = p.uhigh[spec]
+
+        for (changed_spec, stoch) in net_stoch(p, rx.idx)
+            changed_spec == spec || continue
+
+            if direction > 0 && stoch < 0
+                low -= δ * stoch
+            elseif direction < 0 && stoch > 0
+                high -= δ * stoch
+            end
+
+            break
+        end
+
+        p.ulow_rx[spec] = low
+        p.uhigh_rx[spec] = high
+        neg |= direction > 0 ? low < 0 : high < 0
+    end
+
+    neg
+end
 
 """
 compute a reaction specific lower bound that is tighter than `p.ulow`
 """
-@inline function lower_state!(p::TauSplittingJumpAggregation, rx::ReactionEntry)
+@inline function lower_state!(
+    p::TauSplittingJumpAggregation,
+    rx::ReactionEntry,
+    ::IncreasingBounds,
+)
     v = p.ulow_rx
     neg = false
+
     @inbounds for spec in jump_inputs(p, rx.idx)
         x = p.ulow[spec]
         x < 0 && (neg = true)
         v[spec] = x
+        p.uhigh_rx[spec] = p.uhigh[spec]
     end
+
     δ = min(rx.count, 1)
+
     @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
         stoch < 0 || continue
         x = p.ulow[spec] - δ * stoch
         x < 0 && (neg = true)
         v[spec] = x
     end
-    return neg
+
+    neg
 end
 
 @inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, params, t)
-    # C1
-    jump_upper_bound(p.propensity_bounds, rx.idx, p.ulow, p.uhigh, p.ma_jumps, p.rates, params, t) < rx.rate_high || return false
-    # C2
-    lower_state!(p, rx) && return false
-    return rx.rate_low <= jump_lower_bound(p.propensity_bounds, rx.idx, p.ulow, p.uhigh, p.ma_jumps, p.rates, params, t)
+    num_majumps = get_num_majumps(p.ma_jumps)
+    if rx.idx <= num_majumps
+        jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
+        lower_state!(p, rx, IncreasingBounds()) && return false
+        return rx.rate_low <= jump_rate(p, rx.idx, p.ulow_rx, params, t)
+    end
+
+    crx = rx.idx - num_majumps
+    jump_upper_bound(p.propensity_bounds, crx, p.ulow, p.uhigh, p.rates, params, t) < rx.rate_high || return false
+    lower_state!(p, rx, p.propensity_bounds) && return false
+    return rx.rate_low <= jump_lower_bound(p.propensity_bounds, crx, p.ulow_rx, p.uhigh_rx, p.rates, params, t)
 end
 
 # because an inactive reaction's count is not accounted for in the state `u` during a node's processing, we must ensure its dependents are stable:
