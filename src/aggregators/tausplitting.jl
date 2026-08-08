@@ -107,7 +107,7 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, U} <
     prev_jump_time::T
     ulow::U
     uhigh::U
-    ulow_scratch::U
+    ulow_rx::U
     nodes::Vector{TauSplittingNode{T}}
     num_unstable_by_spec::Vector{Int} # how many reactions are unstable for each reactant
     rx_inactive_node::Vector{Int}     # 0 if active
@@ -426,23 +426,29 @@ end
 compute a reaction specific lower bound that is tighter than `p.ulow`
 """
 @inline function lower_state!(p::TauSplittingJumpAggregation, rx::ReactionEntry)
-    v = p.ulow_scratch
+    v = p.ulow_rx
+    neg = false
     @inbounds for spec in jump_inputs(p, rx.idx)
-        v[spec] = p.ulow[spec]
+        x = p.ulow[spec]
+        x < 0 && (neg = true)
+        v[spec] = x
     end
     δ = min(rx.count, 1)
     @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
-        stoch < 0 && (v[spec] = max(p.ulow[spec] - δ * stoch, zero(eltype(v))))
+        stoch < 0 || continue
+        x = p.ulow[spec] - δ * stoch
+        x < 0 && (neg = true)
+        v[spec] = x
     end
-    v
+    return neg
 end
 
 @inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, params, t)
     # C1
     jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
     # C2
-    ulow_rx = lower_state!(p, rx)
-    return rx.rate_low <= jump_rate(p, rx.idx, ulow_rx, params, t)
+    lower_state!(p, rx) && return false
+    return rx.rate_low <= jump_rate(p, rx.idx, p.ulow_rx, params, t)
 end
 
 # because an inactive reaction's count is not accounted for in the state `u` during a node's processing, we must ensure its dependents are stable:
