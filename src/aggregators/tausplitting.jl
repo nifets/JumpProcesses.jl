@@ -104,6 +104,14 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, 
     vartojumps_map::VJMAP
     spec_to_writer_rxs::Vector{Vector{Int}}
     rx_to_reader_specs::Vector{Vector{Int}}
+    # flattened (CSR) copies of the two per-reaction maps that are walked in the
+    # inner loops: entries for reaction `i` live in `flat[off[i]:off[i+1]-1]`
+    stoch_flat::Vector{Pair{Int, Int}}
+    stoch_off::Vector{Int}
+    react_flat::Vector{Pair{Int, Int}}
+    react_off::Vector{Int}
+    reader_flat::Vector{Int}
+    reader_off::Vector{Int}
     propensity_bounds::PB
     prev_jump_time::T
     ulow::U
@@ -113,6 +121,7 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, 
     nodes::Vector{TauSplittingNode{T}}
     num_unstable_by_spec::Vector{Int} # how many reactions are unstable for each reactant
     rx_inactive_node::Vector{Int}     # 0 if active
+    rx_inactive_pos::Vector{Int}      # index of the entry within that node's `inactive`
     rx_stable::Vector{Bool}
     max_interval::T
 end
@@ -176,10 +185,44 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
         push!(rx_to_reader_specs[rx], spec)
     end
 
+    # flatten the per-reaction stoichiometry and reader maps into CSR arrays so
+    # that the inner loops stream contiguous memory instead of chasing a pointer
+    # per reaction into a separately allocated inner vector
+    nummaj = get_num_majumps(maj)
+    stoch_of(rx) = rx <= nummaj ? maj.net_stoch[rx] : jtos_map[rx - nummaj]
+
+    stoch_off = Vector{Int}(undef, numrxs + 1)
+    stoch_flat = Vector{Pair{Int, Int}}()
+    sizehint!(stoch_flat, sum(rx -> length(stoch_of(rx)), 1:numrxs; init = 0))
+    for rx in 1:numrxs
+        stoch_off[rx] = length(stoch_flat) + 1
+        append!(stoch_flat, stoch_of(rx))
+    end
+    stoch_off[numrxs + 1] = length(stoch_flat) + 1
+
+    # same treatment for the mass action reactant stoichiometry, which is what
+    # the rate evaluation walks on every C1/C2 check
+    react_off = Vector{Int}(undef, nummaj + 1)
+    react_flat = Vector{Pair{Int, Int}}()
+    for rx in 1:nummaj
+        react_off[rx] = length(react_flat) + 1
+        append!(react_flat, maj.reactant_stoch[rx])
+    end
+    react_off[nummaj + 1] = length(react_flat) + 1
+
+    reader_off = Vector{Int}(undef, numrxs + 1)
+    reader_flat = Vector{Int}()
+    sizehint!(reader_flat, sum(length, rx_to_reader_specs; init = 0))
+    for rx in 1:numrxs
+        reader_off[rx] = length(reader_flat) + 1
+        append!(reader_flat, rx_to_reader_specs[rx])
+    end
+    reader_off[numrxs + 1] = length(reader_flat) + 1
+
     pb = propensity_bounds
 
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, pb, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, stoch_flat, stoch_off, react_flat, react_off, reader_flat, reader_off, pb, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
@@ -276,6 +319,7 @@ function process_node!(p::TauSplittingJumpAggregation, depth, integrator, params
         if can_deactivate(p, rx)
             p.rx_inactive_node[rx.idx] = depth
             push!(node.inactive, rx)
+            p.rx_inactive_pos[rx.idx] = length(node.inactive)
         else
             keep += 1
             active[keep] = rx
@@ -342,9 +386,16 @@ function reactivate!(p::TauSplittingJumpAggregation, rxidx, curr_depth, integrat
 
     node = p.nodes[depth]
 
-    i = findfirst(r -> r.idx == rxidx, node.inactive)
-    rx = node.inactive[i]
-    deleteat!(node.inactive, i)
+    # O(1) removal: swap the entry with the last one and pop, keeping
+    # `rx_inactive_pos` in sync for the element that moved
+    @inbounds begin
+        i = p.rx_inactive_pos[rxidx]
+        rx = node.inactive[i]
+        last_rx = node.inactive[end]
+        node.inactive[i] = last_rx
+        p.rx_inactive_pos[last_rx.idx] = i
+        pop!(node.inactive)
+    end
     p.rx_inactive_node[rxidx] = 0
 
     remove_slack!(p, rx)
@@ -388,18 +439,35 @@ function init_node!(p::TauSplittingJumpAggregation{T}, depth, t0, Δt) where {T}
 end
 
 @inline function net_stoch(p, rxidx)
-    nummaj = get_num_majumps(p.ma_jumps)
-    @inbounds rxidx <= nummaj ? p.ma_jumps.net_stoch[rxidx] : p.jumptostoich_map[rxidx - nummaj]
+    @inbounds view(p.stoch_flat, p.stoch_off[rxidx]:(p.stoch_off[rxidx + 1] - 1))
 end
 
-@inline jump_inputs(p, rxidx) = p.rx_to_reader_specs[rxidx]
+@inline function jump_inputs(p, rxidx)
+    @inbounds view(p.reader_flat, p.reader_off[rxidx]:(p.reader_off[rxidx + 1] - 1))
+end
 @inline jump_outputs(p, rxidx) = (spec for (spec, _) in net_stoch(p, rxidx))
 
 @inline num_rxs(p) = get_num_majumps(p.ma_jumps) + length(p.rates)
 
+# mass action rate evaluated against the flattened reactant stoichiometry
+@inline function ma_rate(p, rxidx, u)
+    val = 1
+    @inbounds for k in p.react_off[rxidx]:(p.react_off[rxidx + 1] - 1)
+        entry = p.react_flat[k]
+        specpop = u[entry.first]
+        val *= specpop
+        for _ in 2:entry.second
+            specpop -= 1
+            val *= specpop
+        end
+    end
+    @inbounds val * p.ma_jumps.scaled_rates[rxidx]
+end
+
 @inline function jump_rate(p, rxidx, u, params, t)
-    calculate_jump_rate(
-        p.ma_jumps, get_num_majumps(p.ma_jumps), p.rates, u, params, t, rxidx)
+    nummaj = get_num_majumps(p.ma_jumps)
+    rxidx <= nummaj && return ma_rate(p, rxidx, u)
+    @inbounds return p.rates[rxidx - nummaj](u, params, t)
 end
 
 @inline function add_net_stoch!(p, dest, rx)
