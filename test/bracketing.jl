@@ -8,7 +8,7 @@ bd = BracketData(fluctuation_rate, threshold, Δu)
 
 ### Getters ###
 species_index = 1
-# The fluctuation rate δ corresponds to species brackets (1-δ)*u, (1+δ)*u. So 0 < δ < 1. 
+# The fluctuation rate δ corresponds to species brackets (1-δ)*u, (1+δ)*u. So 0 < δ < 1.
 @test 0 < JP.getfr(bd, species_index) < 1
 # If u < threshold, then the brackets are (max(u-Δu, 0), u+Δu). So 0 <= threshold and 0 <= Δu.
 @test 0 <= JP.gettv(bd, species_index)
@@ -44,11 +44,11 @@ reaction_index = 1
 rate(u, params, t) = 1 / u[1]
 params = nothing
 t = 0.0
-@test JP.get_cjump_brackets(ulow, uhigh, rate, params, t)[1] == 1 / 10 # low
-@test JP.get_cjump_brackets(ulow, uhigh, rate, params, t)[2] == 1 / 2 # high
+@test JP.jump_bounds(MonotoneBounds(), 1, ulow, uhigh, (rate,), params, t)[1] == 1 / 10 # low
+@test JP.jump_bounds(MonotoneBounds(), 1, ulow, uhigh, (rate,), params, t)[2] == 1 / 2 # high
 
 ### Aggregator ###
-mutable struct DummyAggregator{T, M, R, BD} <:
+mutable struct DummyAggregator{T, M, R, BD, PB} <:
                JP.AbstractSSAJumpAggregator{T, M, R, Nothing, Nothing}
     ulow::Vector{Int}
     uhigh::Vector{Int}
@@ -58,12 +58,13 @@ mutable struct DummyAggregator{T, M, R, BD} <:
     ma_jumps::M
     rates::R
     bracket_data::BD
+    propensity_bounds::PB
 end
 # one massaction jump, one constant rate jump
 cur_rate_low = [0.0, 0.0]
 cur_rate_high = [0.0, 0.0]
 sum_rate = 0.0
-p = DummyAggregator([0], [0], cur_rate_low, cur_rate_high, sum_rate, majump, [rate], bd)
+p = DummyAggregator([0], [0], cur_rate_low, cur_rate_high, sum_rate, majump, [rate], bd, JP.MonotoneBounds())
 
 u = [100]
 JP.update_u_brackets!(p, u)
@@ -77,7 +78,7 @@ reaction_index = 2
 @test JP.get_jump_brackets(reaction_index, p, params, t)[1] == rate(p.uhigh, params, t)
 @test JP.get_jump_brackets(reaction_index, p, params, t)[2] == rate(p.ulow, params, t)
 
-p = DummyAggregator([0], [0], cur_rate_low, cur_rate_high, sum_rate, majump, [rate], bd)
+p = DummyAggregator([0], [0], cur_rate_low, cur_rate_high, sum_rate, majump, [rate], bd, JP.MonotoneBounds())
 JP.set_bracketing!(p, u, params, t)
 @test p.ulow[1]≈u[1] * (1 - fluctuation_rate) atol=1
 @test p.uhigh[1]≈u[1] * (1 + fluctuation_rate) atol=1
@@ -86,3 +87,13 @@ JP.set_bracketing!(p, u, params, t)
 @test p.cur_rate_low[2] == rate(p.uhigh, params, t)
 @test p.cur_rate_high[2] == rate(p.ulow, params, t)
 @test p.sum_rate ≈ sum(p.cur_rate_high)
+
+@testset "Directional propensity bounds" begin
+    r(u, params, t) = u[1] / u[2]
+    bounds = DirectionalBounds{Int}(
+        [[1 => Int8(1), 2 => Int8(-1)]], 2,
+    )
+    low, high = JP.jump_bounds(bounds, 1, [2, 3], [5,7], (r,), nothing, 0.0)
+    @test low == 2/7
+    @test high == 5/3
+end

@@ -4,7 +4,7 @@
 # functions of the current population sizes (i.e. u)
 # requires vartojumps_map and fluct_rates as JumpProblem keywords
 
-mutable struct RSSAJumpAggregation{T, S, F1, F2, RNG, VJMAP, JVMAP, BD, U} <:
+mutable struct RSSAJumpAggregation{T, S, F1, F2, RNG, VJMAP, JVMAP, BD, PB, U} <:
                AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     next_jump::Int
     prev_jump::Int
@@ -21,6 +21,7 @@ mutable struct RSSAJumpAggregation{T, S, F1, F2, RNG, VJMAP, JVMAP, BD, U} <:
     vartojumps_map::VJMAP
     jumptovars_map::JVMAP
     bracket_data::BD
+    propensity_bounds::PB
     ulow::U
     uhigh::U
 end
@@ -29,7 +30,7 @@ function RSSAJumpAggregation(nj::Int, njt::T, et::T, crs::Vector{T}, sr::T,
         maj::S, rs::F1, affs!::F2, sps::Tuple{Bool, Bool},
         rng::RNG; u::U, vartojumps_map = nothing,
         jumptovars_map = nothing,
-        bracket_data = nothing, kwargs...) where {T, S, F1, F2, RNG, U}
+        bracket_data = nothing, propensity_bounds = MonotoneBounds(), kwargs...) where {T, S, F1, F2, RNG, U}
     # a dependency graph is needed and must be provided if there are constant rate jumps
     if vartojumps_map === nothing
         if (get_num_majumps(maj) == 0) || !isempty(rs)
@@ -57,6 +58,7 @@ function RSSAJumpAggregation(nj::Int, njt::T, et::T, crs::Vector{T}, sr::T,
 
     # a bracket data structure is needed for updating species populations
     bd = (bracket_data === nothing) ? BracketData{T, eltype(U)}() : bracket_data
+    pb = propensity_bounds
 
     # current bounds on solution
     ulow = similar(u)
@@ -64,9 +66,9 @@ function RSSAJumpAggregation(nj::Int, njt::T, et::T, crs::Vector{T}, sr::T,
 
     affecttype = F2 <: Tuple ? F2 : Any
     RSSAJumpAggregation{T, S, F1, affecttype, RNG, typeof(vtoj_map),
-        typeof(jtov_map), typeof(bd), U}(nj, nj, njt, et, crl_bnds,
+        typeof(jtov_map), typeof(bd), typeof(pb), U}(nj, nj, njt, et, crl_bnds,
         crh_bnds, sr, maj, rs, affs!, sps,
-        rng, vtoj_map, jtov_map, bd, ulow,
+        rng, vtoj_map, jtov_map, bd, pb, ulow,
         uhigh)
 end
 

@@ -4,7 +4,7 @@ Composition-Rejection with Rejection sampling method (RSSA-CR)
 
 const MINJUMPRATE = 2.0^exponent(1e-12)
 
-mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD,
+mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD, PB,
     P <: PriorityTable, W <: Function} <:
                AbstractSSAJumpAggregator{F, S, F1, F2, RNG}
     next_jump::Int
@@ -22,6 +22,7 @@ mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD,
     vartojumps_map::VJMAP
     jumptovars_map::JVMAP
     bracket_data::BD
+    propensity_bounds::PB
     ulow::U
     uhigh::U
     minrate::F
@@ -33,7 +34,7 @@ end
 function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate::F, maj::S,
         rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG; u::U,
         vartojumps_map = nothing, jumptovars_map = nothing,
-        bracket_data = nothing, minrate = convert(F, MINJUMPRATE),
+        bracket_data = nothing, propensity_bounds = MonotoneBounds(), minrate = convert(F, MINJUMPRATE),
         maxrate = convert(F, Inf),
         kwargs...) where {F, S, F1, F2, RNG, U}
     # a dependency graph is needed and must be provided if there are constant rate jumps
@@ -63,6 +64,7 @@ function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate:
 
     # a bracket data structure is needed for updating species populations
     bd = (bracket_data === nothing) ? BracketData{F, eltype(U)}() : bracket_data
+    pb = propensity_bounds
 
     # matrix to store bracketing interval for species and the relative interval width
     # first row is Xlow, second is Xhigh
@@ -81,10 +83,10 @@ function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate:
 
     affecttype = F2 <: Tuple ? F2 : Any
     RSSACRJumpAggregation{typeof(njt), S, F1, affecttype, RNG, U, typeof(vtoj_map),
-        typeof(jtov_map), typeof(bd), typeof(rt),
+        typeof(jtov_map), typeof(bd), typeof(pb), typeof(rt),
         typeof(ratetogroup)}(nj, nj, njt, et, crl_bnds, crh_bnds,
         sum_rate, maj, rs, affs!, sps, rng, vtoj_map,
-        jtov_map, bd, ulow, uhigh, minrate, maxrate,
+        jtov_map, bd, pb, ulow, uhigh, minrate, maxrate,
         rt, ratetogroup)
 end
 
