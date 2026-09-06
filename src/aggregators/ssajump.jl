@@ -111,16 +111,11 @@ Adds a `tstop` to the integrator at the next jump time.
 end
 
 """
-    revise_next_jump_time!(integrator, p::AbstractSSAJumpAggregator, tstop)
+    advance_to!(integrator, p::AbstractSSAJumpAggregator, t)
 
-Notify the aggregator that a new `tstop` was added before its currently scheduled next jump time.
-"""
-@inline revise_next_jump_time!(integrator, p::AbstractSSAJumpAggregator, tstop) = nothing
-
-"""
-    advance_to!(integrator, p::AbstractSSAJumpAggregator, t) = nothing
-
-Advance aggregator's state to time `t` without executing a jump.
+Advance the aggregator's state to time `t`, executing any jumps that occur in
+`(current time, t]`. Defaults to a no-op for aggregators that schedule a single
+next jump.
 """
 @inline advance_to!(integrator, p::AbstractSSAJumpAggregator, t) = nothing
 
@@ -130,7 +125,7 @@ Advance aggregator's state to time `t` without executing a jump.
 
 Helper routine for setting up standard fields of SSA jump aggregations.
 """
-  function build_jump_aggregation(jump_agg_type, u, p, t, end_time, ma_jumps, rates,
+function build_jump_aggregation(jump_agg_type, u, p, t, end_time, ma_jumps, rates,
         affects!, save_positions, rng; kwargs...)
 
     # mass action jumps

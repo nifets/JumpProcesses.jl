@@ -356,10 +356,6 @@ function DiffEqBase.add_tstop!(integrator::SSAIntegrator, tstop)
         end
 
         Base.insert!(integrator.tstops, insert_index, tstop)
-
-        if tstop < integrator.tstop
-            revise_next_jump_time!(integrator, integrator.cb.condition, tstop)
-        end
     end
     nothing
 end
