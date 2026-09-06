@@ -86,7 +86,7 @@ Turn a left sibling node into a right sibling node due for processing
     nothing
 end
 
-mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, U} <:
+mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, LU, U} <:
                AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     next_jump::Int     # not used
     prev_jump::Int     # not used
@@ -112,7 +112,8 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, PB, 
     react_off::Vector{Int}
     reader_flat::Vector{Int}
     reader_off::Vector{Int}
-    propensity_bounds::PB
+    lrates::LU
+    urates::LU
     prev_jump_time::T
     ulow::U
     uhigh::U
@@ -128,7 +129,7 @@ end
 
 function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::Nothing,
     maj::S, rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG;
-    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, jumptostoich_map = nothing, max_interval = typemax(T), propensity_bounds=IncreasingBounds(), kwargs...) where {T,S,F1,F2,RNG,U}
+    u::U, dep_graph = nothing, vartojumps_map = nothing, jumptovars_map = nothing, jumptostoich_map = nothing, max_interval = typemax(T), lrates, urates, kwargs...) where {T,S,F1,F2,RNG,U}
 
     numspec = length(u)
     numrxs = get_num_majumps(maj) + length(rs)
@@ -219,19 +220,18 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
     end
     reader_off[numrxs + 1] = length(reader_flat) + 1
 
-    pb = propensity_bounds
-
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(pb), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, stoch_flat, stoch_off, react_flat, react_off, reader_flat, reader_off, pb, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(lrates), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, stoch_flat, stoch_off, react_flat, react_off, reader_flat, reader_off, lrates, urates, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
         ma_jumps, save_positions, rng; kwargs...)
     rates, affects! = get_jump_info_fwrappers(u, p, t, constant_jumps)
+    lrates, urates = get_jump_bound_fwrappers(u, p, t, constant_jumps)
     next_jump = 0
     next_jump_time = typemax(t)
     TauSplittingJumpAggregation(next_jump, next_jump_time, end_time, nothing, nothing,
-        ma_jumps, rates, affects!, save_positions, rng; u, kwargs...)
+        ma_jumps, rates, affects!, save_positions, rng; u, lrates, urates, kwargs...)
 end
 
 function initialize!(p::TauSplittingJumpAggregation, integrator, u, params, t)
@@ -493,47 +493,12 @@ end
 @inline add_slack!(p, rx) = change_slack!(p, rx, 1)
 @inline remove_slack!(p, rx) = change_slack!(p, rx, -1)
 
-@inline function lower_state!(
-    p::TauSplittingJumpAggregation,
-    rx::ReactionEntry,
-    pb::DirectionalBounds,
-)
-    δ = min(rx.count, 1)
-    neg = false
-
-    crx = rx.idx - get_num_majumps(p.ma_jumps)
-    @inbounds for (spec, direction) in pb.dirs[crx]
-        low = p.ulow[spec]
-        high = p.uhigh[spec]
-
-        for (changed_spec, stoch) in net_stoch(p, rx.idx)
-            changed_spec == spec || continue
-
-            if direction > 0 && stoch < 0
-                low -= δ * stoch
-            elseif direction < 0 && stoch > 0
-                high -= δ * stoch
-            end
-
-            break
-        end
-
-        p.ulow_rx[spec] = low
-        p.uhigh_rx[spec] = high
-        neg |= direction > 0 ? low < 0 : high < 0
-    end
-
-    neg
-end
-
 """
-compute a reaction specific lower bound that is tighter than `p.ulow`
+compute a reaction specific state interval tighter than `[p.ulow, p.uhigh]`, excluding the
+reaction's own firings: species it consumes cannot fall as low, and species it produces
+cannot rise as high
 """
-@inline function lower_state!(
-    p::TauSplittingJumpAggregation,
-    rx::ReactionEntry,
-    ::IncreasingBounds,
-)
+@inline function lower_state!(p::TauSplittingJumpAggregation, rx::ReactionEntry)
     v = p.ulow_rx
     neg = false
 
@@ -547,10 +512,15 @@ compute a reaction specific lower bound that is tighter than `p.ulow`
     δ = min(rx.count, 1)
 
     @inbounds for (spec, stoch) in net_stoch(p, rx.idx)
-        stoch < 0 || continue
-        x = p.ulow[spec] - δ * stoch
-        x < 0 && (neg = true)
-        v[spec] = x
+        if stoch < 0
+            x = p.ulow[spec] - δ * stoch
+            x < 0 && (neg = true)
+            v[spec] = x
+        else
+            x = p.uhigh[spec] - δ * stoch
+            x < 0 && (neg = true)
+            p.uhigh_rx[spec] = x
+        end
     end
 
     neg
@@ -560,14 +530,14 @@ end
     num_majumps = get_num_majumps(p.ma_jumps)
     if rx.idx <= num_majumps
         jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
-        lower_state!(p, rx, IncreasingBounds()) && return false
+        lower_state!(p, rx) && return false
         return rx.rate_low <= jump_rate(p, rx.idx, p.ulow_rx, params, t)
     end
 
     crx = rx.idx - num_majumps
-    jump_upper_bound(p.propensity_bounds, crx, p.ulow, p.uhigh, p.rates, params, t) < rx.rate_high || return false
-    lower_state!(p, rx, p.propensity_bounds) && return false
-    return rx.rate_low <= jump_lower_bound(p.propensity_bounds, crx, p.ulow_rx, p.uhigh_rx, p.rates, params, t)
+    @inbounds p.urates[crx](p.ulow, p.uhigh, params, t) < rx.rate_high || return false
+    lower_state!(p, rx) && return false
+    @inbounds return rx.rate_low <= p.lrates[crx](p.ulow_rx, p.uhigh_rx, params, t)
 end
 
 # because an inactive reaction's count is not accounted for in the state `u` during a node's processing, we must ensure its dependents are stable:

@@ -4,7 +4,7 @@ Composition-Rejection with Rejection sampling method (RSSA-CR)
 
 const MINJUMPRATE = 2.0^exponent(1e-12)
 
-mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD, PB,
+mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, CB, U, VJMAP, JVMAP, BD,
     P <: PriorityTable, W <: Function} <:
                AbstractSSAJumpAggregator{F, S, F1, F2, RNG}
     next_jump::Int
@@ -17,12 +17,12 @@ mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD, PB,
     ma_jumps::S
     rates::F1
     affects!::F2
+    brackets::CB
     save_positions::Tuple{Bool, Bool}
     rng::RNG
     vartojumps_map::VJMAP
     jumptovars_map::JVMAP
     bracket_data::BD
-    propensity_bounds::PB
     ulow::U
     uhigh::U
     minrate::F
@@ -32,9 +32,9 @@ mutable struct RSSACRJumpAggregation{F, S, F1, F2, RNG, U, VJMAP, JVMAP, BD, PB,
 end
 
 function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate::F, maj::S,
-        rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG; u::U,
+        rs::F1, affs!::F2, sps::Tuple{Bool, Bool}, rng::RNG; u::U, brackets,
         vartojumps_map = nothing, jumptovars_map = nothing,
-        bracket_data = nothing, propensity_bounds = MonotoneBounds(), minrate = convert(F, MINJUMPRATE),
+        bracket_data = nothing, minrate = convert(F, MINJUMPRATE),
         maxrate = convert(F, Inf),
         kwargs...) where {F, S, F1, F2, RNG, U}
     # a dependency graph is needed and must be provided if there are constant rate jumps
@@ -64,7 +64,6 @@ function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate:
 
     # a bracket data structure is needed for updating species populations
     bd = (bracket_data === nothing) ? BracketData{F, eltype(U)}() : bracket_data
-    pb = propensity_bounds
 
     # matrix to store bracketing interval for species and the relative interval width
     # first row is Xlow, second is Xhigh
@@ -82,11 +81,11 @@ function RSSACRJumpAggregation(nj::Int, njt::F, et::F, crs::Vector{F}, sum_rate:
     rt = PriorityTable(ratetogroup, zeros(F, 1), minrate, 2 * minrate)
 
     affecttype = F2 <: Tuple ? F2 : Any
-    RSSACRJumpAggregation{typeof(njt), S, F1, affecttype, RNG, U, typeof(vtoj_map),
-        typeof(jtov_map), typeof(bd), typeof(pb), typeof(rt),
+    RSSACRJumpAggregation{typeof(njt), S, F1, affecttype, RNG, typeof(brackets), U,
+        typeof(vtoj_map), typeof(jtov_map), typeof(bd), typeof(rt),
         typeof(ratetogroup)}(nj, nj, njt, et, crl_bnds, crh_bnds,
-        sum_rate, maj, rs, affs!, sps, rng, vtoj_map,
-        jtov_map, bd, pb, ulow, uhigh, minrate, maxrate,
+        sum_rate, maj, rs, affs!, brackets, sps, rng, vtoj_map,
+        jtov_map, bd, ulow, uhigh, minrate, maxrate,
         rt, ratetogroup)
 end
 
@@ -98,13 +97,14 @@ function aggregate(aggregator::RSSACR, u, p, t, end_time, constant_jumps,
 
     # handle constant jumps using function wrappers
     rates, affects! = get_jump_info_fwrappers(u, p, t, constant_jumps)
+    brackets = get_jump_bracket_fwrappers(u, p, t, constant_jumps)
 
     build_jump_aggregation(RSSACRJumpAggregation, u, p, t, end_time, ma_jumps,
-        rates, affects!, save_positions, rng; u = u, kwargs...)
+        rates, affects!, save_positions, rng; u = u, brackets, kwargs...)
 end
 
 # set up a new simulation and calculate the first jump / jump time
-function initialize!(p::RSSACRJumpAggregation, integrator, u, params, t)
+function initialize!(p::RSSACRJumpAggregation, integrator, u, params, t::Number)
     p.end_time = integrator.sol.prob.tspan[2]
     set_bracketing!(p, u, params, t)
 

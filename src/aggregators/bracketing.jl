@@ -91,10 +91,9 @@ get brackets for the rate of reaction rx by first checking if the reaction is a 
     num_majumps = get_num_majumps(ma_jumps)
     if rx <= num_majumps
         return get_majump_brackets(p.ulow, p.uhigh, rx, ma_jumps)
+    else
+        @inbounds return p.brackets[rx - num_majumps](p.ulow, p.uhigh, params, t)
     end
-
-    crx = rx - num_majumps
-    return jump_bounds(p.propensity_bounds, crx, p.ulow, p.uhigh, p.rates, params, t)
 end
 
 # Update species i brackets in the aggregator.
@@ -121,17 +120,14 @@ end
 end
 
 # Set up bracketing. The aggregator must have fields
-#    ulow, uhigh, cur_rate_low, cur_rate_high, sum_rate, ma_jumps, rates.
+#    ulow, uhigh, cur_rate_low, cur_rate_high, sum_rate, ma_jumps, rates, brackets
 function set_bracketing!(p::AbstractSSAJumpAggregator, u, params, t)
     # species bracketing interval
     update_u_brackets!(p, u)
 
     # reaction rate bracketing interval
-    # mass action jumps
     sum_rate = zero(p.sum_rate)
-    num_jumps = get_num_majumps(p.ma_jumps) + length(p.rates)
-
-    @inbounds for rx in 1:num_jumps
+    @inbounds for rx in 1:(get_num_majumps(p.ma_jumps) + length(p.brackets))
         p.cur_rate_low[rx], p.cur_rate_high[rx] = get_jump_brackets(rx, p, params, t)
         sum_rate += p.cur_rate_high[rx]
     end
