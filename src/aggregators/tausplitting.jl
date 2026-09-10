@@ -227,7 +227,8 @@ end
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
         ma_jumps, save_positions, rng; kwargs...)
     rates, affects! = get_jump_info_fwrappers(u, p, t, constant_jumps)
-    lrates, urates = get_jump_bound_fwrappers(u, p, t, constant_jumps)
+    lrates = get_jump_lrate_fwrappers(u, p, t, constant_jumps, aggregator)
+    urates = get_jump_urate_fwrappers(u, p, t, constant_jumps, aggregator)
     next_jump = 0
     next_jump_time = typemax(t)
     TauSplittingJumpAggregation(next_jump, next_jump_time, end_time, nothing, nothing,
