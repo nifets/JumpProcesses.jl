@@ -294,7 +294,7 @@ function process_node!(p::TauSplittingJumpAggregation, depth, integrator, params
     while i <= length(active)
         rx = active[i]
         stable_before = p.rx_stable[rx.idx]
-        stable_now = is_stable(p, rx, params, node.t0)
+        stable_now = is_stable(p, rx, integrator.u, params, node.t0)
         if stable_before != stable_now
             p.rx_stable[rx.idx] = stable_now
             for spec in jump_inputs(p, rx.idx)
@@ -527,7 +527,7 @@ cannot rise as high
     neg
 end
 
-@inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, params, t)
+@inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, u, params, t)
     num_majumps = get_num_majumps(p.ma_jumps)
     if rx.idx <= num_majumps
         jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
@@ -536,9 +536,9 @@ end
     end
 
     crx = rx.idx - num_majumps
-    @inbounds p.urates[crx](p.ulow, p.uhigh, params, t) < rx.rate_high || return false
+    @inbounds p.urates[crx](p.ulow, p.uhigh, u, params, t) < rx.rate_high || return false
     lower_state!(p, rx) && return false
-    @inbounds return rx.rate_low <= p.lrates[crx](p.ulow_rx, p.uhigh_rx, params, t)
+    @inbounds return rx.rate_low <= p.lrates[crx](p.ulow_rx, p.uhigh_rx, u, params, t)
 end
 
 # because an inactive reaction's count is not accounted for in the state `u` during a node's processing, we must ensure its dependents are stable:
