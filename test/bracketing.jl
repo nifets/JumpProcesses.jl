@@ -66,7 +66,7 @@ end
 cur_rate_low = [0.0, 0.0]
 cur_rate_high = [0.0, 0.0]
 sum_rate = 0.0
-brackets = JP.get_jump_bounds_fwrappers(ulow, params, t, (crj,), RSSA())
+brackets = JP.get_jump_bracket_fwrappers(ulow, params, t, (crj,), RSSA())
 p = DummyAggregator([0], [0], cur_rate_low, cur_rate_high, sum_rate, majump,
     [rate], brackets, bd)
 
@@ -115,7 +115,7 @@ lo = JP.lower_rate_bound(split_crj, box_low, box_high, params, t)
 hi = JP.upper_rate_bound(split_crj, box_low, box_high, params, t)
 @test all(lo <= nonmonotonic_rate(u, params, t) <= hi for u in box_states)
 
-@test_throws ErrorException JP.get_jump_bounds_fwrappers(box_low, params, t,
+@test_throws ErrorException JP.get_jump_bracket_fwrappers(box_low, params, t,
     (split_crj,), RSSA())
 @test_throws ErrorException JP.get_jump_lrate_fwrappers(box_low, params, t,
     (joint_crj,), RSSA())

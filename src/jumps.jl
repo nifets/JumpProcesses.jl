@@ -940,7 +940,7 @@ function get_jump_info_fwrappers(u, p, t, jumps)
     rates, affects!
 end
 
-function get_jump_bounds_fwrappers(u, p, t, jumps, agg)
+function get_jump_bracket_fwrappers(u, p, t, jumps, agg)
     BracketWrapper = FunctionWrappers.FunctionWrapper{Tuple{typeof(t), typeof(t)},
         Tuple{typeof(u), typeof(u), typeof(p), typeof(t)}}
 
@@ -948,13 +948,13 @@ function get_jump_bounds_fwrappers(u, p, t, jumps, agg)
         for (i, c) in enumerate(jumps)
             check_jump_bounds(c, i, agg)
         end
-        [BracketWrapper(make_bounds_fn(c)) for c in jumps]
+        [BracketWrapper(make_bracket_fn(c)) for c in jumps]
     else
         Vector{BracketWrapper}()
     end
 end
 
-make_bounds_fn(c::ConstantRateJump) =
+make_bracket_fn(c::ConstantRateJump) =
     (ulow, uhigh, p, t) -> cjump_brackets(c, ulow, uhigh, p, t)
 
 function get_jump_lrate_fwrappers(u, p, t, jumps, agg)
