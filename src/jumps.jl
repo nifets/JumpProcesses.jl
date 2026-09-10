@@ -16,10 +16,33 @@ $(FIELDS)
 
 ## Examples
 
+Increasing rate in one species but decreasing in another:
 ```julia
 rate(u, p, t) = p[1] * u[1] / (1 + u[2])
 bounds(ulow, uhigh, u, p, t) = RateBounds(lrate = p[1] * ulow[1] / (1 + uhigh[2]),
                                           urate = p[1] * uhigh[1] / (1 + ulow[2]))
+```
+
+Extremas lying inside the bracket:
+```julia
+rate(u, p, t) = p[1] * u[1] * (p[2] - u[1])
+function bounds(ulow, uhigh, u, p, t)
+    L = p[1] * max(abs(p[2] - 2*ulow[1]), abs(p[2] - 2*uhigh[1]))
+    δr = L * max(u[1] - ulow[1], uhigh[1] - u[1])
+    r = rate(u, p, t)
+    RateBounds(lrate = max(r - δr, zero(r)), urate = r + δr)
+end
+```
+
+Rate that depends on time:
+```julia
+rate(u, p, t) = p[1] * u[1] * exp(-p[2] * t)
+function bounds(ulow, uhigh, u, p, t)
+    Δ = p[3]
+    RateBounds(lrate = p[1] * ulow[1] * exp(-p[2] * (t + Δ)),
+               urate = p[1] * uhigh[1] * exp(-p[2] * t),
+               rateinterval = Δ)
+end
 ```
 """
 struct RateBounds{R, T}
