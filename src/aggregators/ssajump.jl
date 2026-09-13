@@ -197,8 +197,10 @@ Notes:
 
   - Intended for methods that have a dependency graph, i.e. define `p.dep_gr`.
 """
-function update_dependent_rates!(p::AbstractSSAJumpAggregator, u, params, t)
-    @inbounds dep_rxs = p.dep_gr[p.next_jump]
+update_dependent_rates!(p::AbstractSSAJumpAggregator, u, params, t) =
+    update_dependent_rates!(p, u, params, t, @inbounds p.dep_gr[p.next_jump])
+
+function update_dependent_rates!(p::AbstractSSAJumpAggregator, u, params, t, dep_rxs)
     cur_rates = p.cur_rates
     sum_rate = p.sum_rate
     num_majumps = get_num_majumps(p.ma_jumps)

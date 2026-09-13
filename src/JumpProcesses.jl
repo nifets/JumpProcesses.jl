@@ -121,6 +121,9 @@ export CCNRM
 include("aggregators/tausplitting.jl")
 export TauSplitting
 
+include("aggregators/hybridtau.jl")
+export HybridTau, CriticalBlend, LinearBlend, AlwaysLeap
+
 include("aggregators/aggregated_api.jl")
 
 # variable rate aggregators (i.e. SSAs)

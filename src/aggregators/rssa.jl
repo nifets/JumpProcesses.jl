@@ -144,13 +144,16 @@ end
 """
 Update rates
 """
-@inline function update_rates!(p::RSSAJumpAggregation, u::AbstractVector, params, t)
+@inline update_rates!(p::RSSAJumpAggregation, u::AbstractVector, params, t) =
+    update_rates!(p, u, params, t, p.jumptovars_map[p.next_jump])
+
+@inline function update_rates!(p::RSSAJumpAggregation, u::AbstractVector, params, t, uidxs)
     # update bracketing intervals
     (; ulow, uhigh) = p
     sum_rate = p.sum_rate
     crhigh = p.cur_rate_high
 
-    @inbounds for uidx in p.jumptovars_map[p.next_jump]
+    @inbounds for uidx in uidxs
         uval = u[uidx]
 
         # if new u value is outside the bracketing interval
@@ -169,12 +172,15 @@ Update rates
     p.sum_rate = sum_rate
 end
 
-@inline function update_rates!(p::RSSAJumpAggregation, u::SVector, params, t)
+@inline update_rates!(p::RSSAJumpAggregation, u::SVector, params, t) =
+    update_rates!(p, u, params, t, p.jumptovars_map[p.next_jump])
+
+@inline function update_rates!(p::RSSAJumpAggregation, u::SVector, params, t, uidxs)
     # update bracketing intervals
     sum_rate = p.sum_rate
     crhigh = p.cur_rate_high
 
-    @inbounds for uidx in p.jumptovars_map[p.next_jump]
+    @inbounds for uidx in uidxs
         uval = u[uidx]
 
         # if new u value is outside the bracketing interval

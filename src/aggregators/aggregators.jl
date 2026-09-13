@@ -182,6 +182,15 @@ Ron Solan and Gad Getz, An exact tau-leaping method (2025). doi: 10.48550/arXiv.
 """
 struct TauSplitting <: AbstractAggregatorAlgorithm end
 
+struct HybridTau{A, B, T} <: AbstractAggregatorAlgorithm
+    exact::A
+    policy::B
+    dt::T
+    epsilon::T
+end
+HybridTau(exact, policy = CriticalBlend(10), dt = Inf; epsilon = 0.05) =
+    HybridTau(exact, policy, promote(dt, epsilon)...)
+
 # For JumpProblem construction without an aggregator
 struct NullAggregator <: AbstractAggregatorAlgorithm end
 
@@ -221,6 +230,7 @@ needs_depgraph(aggregator::CCNRM) = true
 needs_depgraph(aggregator::RDirect) = true
 needs_depgraph(aggregator::Coevolve) = true
 needs_depgraph(aggregator::TauSplitting) = true
+needs_depgraph(aggregator::HybridTau) = true
 
 # true if aggregator requires a map from solution variable to dependent jumps.
 # It is implicitly assumed these aggregators also require the reverse map, from
@@ -253,6 +263,11 @@ needs_vartojumps_map(aggregator::AbstractAggregatorAlgorithm) = false
 needs_vartojumps_map(aggregator::RSSA) = true
 needs_vartojumps_map(aggregator::RSSACR) = true
 needs_vartojumps_map(aggregator::TauSplitting) = true
+needs_vartojumps_map(aggregator::HybridTau) = true
+
+needs_bracketing(aggregator::AbstractAggregatorAlgorithm) = false
+needs_bracketing(aggregator::RSSA) = true
+needs_bracketing(aggregator::RSSACR) = true
 
 # true if aggregator supports variable rates
 supports_variablerates(aggregator::AbstractAggregatorAlgorithm) = false
