@@ -54,6 +54,20 @@ function firings_left(m, i, u)
     L
 end
 
+function self_stoich(maj, nrx)
+    map(1:nrx) do j
+        w = Pair{Int, Float64}[]
+        for (spec, o) in maj.reactant_stoch[j]
+            stoch = 0
+            for (s, n) in maj.net_stoch[j]
+                s == spec && (stoch = n)
+            end
+            iszero(stoch) || push!(w, spec => float(stoch * o))
+        end
+        w
+    end
+end
+
 @inline function evalrxrate(u::AbstractVector{V}, i, m::BlendedMassActionJump) where {V <: Real}
     β = blend(m.policy, m, i, u)
     iszero(β) && return zero(eltype(m.scaled_rates))
@@ -209,6 +223,8 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, CS} <:
     # tau selection
     μ::Vector{Float64}
     σ²::Vector{Float64}
+    χ::Vector{Float64}
+    self_stoch::Vector{Vector{Pair{Int, Float64}}}
     max_hor::Vector{Int}
     max_stoich::Vector{Int}
     # rate caches
@@ -226,7 +242,7 @@ end
 
 
 function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG},
-        policy, dt, epsilon, du, counts, vtoj, max_hor, max_stoich,
+        policy, dt, epsilon, du, counts, vtoj, max_hor, max_stoich, self_stoch,
         crj_stoich) where {T,S,F1,F2,RNG}
     n = length(du)
     nmaj = length(counts)
@@ -252,6 +268,8 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         false,
         zeros(n),
         zeros(n),
+        zeros(n),
+        self_stoch,
         max_hor,
         max_stoich,
         zeros(njs),
@@ -272,9 +290,11 @@ function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_
     nrx = maj === nothing ? 0 : get_num_majumps(maj)
     if maj === nothing
         max_hor = Int[]; max_stoich = Int[]
+        selfs = Vector{Pair{Int, Float64}}[]
     else
         hor = compute_hor(maj.reactant_stoch, nrx)
         max_hor, max_stoich = precompute_reaction_conditions(maj.reactant_stoch, hor, length(u), nrx)
+        selfs = self_stoich(maj, nrx)
     end
     kw = values(kwargs)
     if maj !== nothing && needs_bracketing(aggregator.exact)
@@ -293,7 +313,7 @@ function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_
         vtoj = var_to_jumps_map(length(u), maj)
     end
     HybridTauJumpAggregation(inner, aggregator.policy, aggregator.dt, aggregator.epsilon,
-        zero(u), zeros(Int, nrx), vtoj, max_hor, max_stoich,
+        zero(u), zeros(Int, nrx), vtoj, max_hor, max_stoich, selfs,
         get(kwargs, :crj_stoich, nothing))
 end
 
@@ -356,7 +376,7 @@ end
 
 function open_window!(p, integrator, u, params, t)
     refresh_rates!(p, p.ma_jumps, u, params, t)
-    τ = min(p.dt, tau_from_moments(u, p.μ, p.σ², eachindex(u), p.max_hor,
+    τ = min(p.dt, tau_from_moments(u, p.μ, p.σ², p.χ, eachindex(u), p.max_hor,
         p.max_stoich, t, p.epsilon, p.dtmin))
     draw_leap!(p, p.ma_jumps, τ)
     while !feasible(u, p.du, p.changed_specs)
@@ -412,9 +432,10 @@ jump_leap_rate(p, m, j, u, a) = j <= get_num_majumps(m) ?
 njumps(p) = length(p.rate)
 
 function recompute_rates!(p, m::BlendedMassActionJump, u, params, t)
-    (; leap_rate, rate, μ, σ², ulast) = p
+    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast) = p
     fill!(μ, 0.0)
     fill!(σ², 0.0)
+    fill!(χ, 0.0)
     @inbounds for j in 1:njumps(p)
         a = jump_rate(p, m, j, u, params, t)
         rate[j] = a
@@ -424,6 +445,11 @@ function recompute_rates!(p, m::BlendedMassActionJump, u, params, t)
             μ[spec] += ν * a
             σ²[spec] += ν * ν * a
         end
+        if j <= get_num_majumps(m)
+            for (spec, w) in self_stoch[j]
+                χ[spec] += w * a
+            end
+        end
     end
     copyto!(ulast, u)
     nothing
@@ -431,7 +457,7 @@ end
 
 function refresh_rates!(p, m::BlendedMassActionJump, u, params, t)
     p.vartojumps_map === nothing && return recompute_rates!(p, m, u, params, t)
-    (; leap_rate, rate, μ, σ², ulast, stale_rxs, vartojumps_map) = p
+    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast, stale_rxs, vartojumps_map) = p
     njs = njumps(p)
     empty!(stale_rxs)
     @inbounds for i in eachindex(u)
@@ -451,11 +477,16 @@ function refresh_rates!(p, m::BlendedMassActionJump, u, params, t)
             μ[spec] += ν * d
             σ²[spec] += ν * ν * d
         end
+        if j <= get_num_majumps(m)
+            for (spec, w) in self_stoch[j]
+                χ[spec] += w * d
+            end
+        end
     end
     nothing
 end
 
-function tau_from_moments(u, μ, σ², idxs, max_hor, max_stoich, t, epsilon, dtmin)
+function tau_from_moments(u, μ, σ², χ, idxs, max_hor, max_stoich, t, epsilon, dtmin)
     τ = typemax(typeof(t))
     @inbounds for i in idxs
         gi = compute_gi(u, max_hor, max_stoich, i, t)
@@ -463,10 +494,14 @@ function tau_from_moments(u, μ, σ², idxs, max_hor, max_stoich, t, epsilon, dt
         m = abs(μ[i])
         m > 0 && (τ = min(τ, bound / m))
         s = σ²[i]
-        if s > 0
-            τ = min(τ, bound * bound / s)
-            τ = min(τ, max(u[i], one(eltype(u))) / s)
-        end
+        s > 0 && (τ = min(τ, bound * bound / s))
+
+        # check if iteration x = x + τμ(x) is stable
+        # i.e. τ < 2 / max{λ} where λ are the e-values of the linearisation
+        # to avoid computing the full Jacobian, we can use the diagonal entries as an approximation, halving by two to be conservative
+        # Jᵢᵢ = Σⱼ νᵢⱼ·∂aⱼ/∂xᵢ = Σⱼ νᵢⱼ·oᵢⱼ·aⱼ/xᵢ = χ[i]/u[i]
+        f = abs(χ[i])
+        f > 0 && (τ = min(τ, max(u[i], one(eltype(u))) / f))
     end
     max(τ, dtmin)
 end
