@@ -238,6 +238,8 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, CS} <:
     counts::Vector{Int}
     du::U
     changed_specs::SparseIndices
+    taus::Vector{T}
+    stale_taus::SparseIndices
 end
 
 
@@ -280,6 +282,8 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         SparseIndices(njs),
         counts,
         du,
+        SparseIndices(n),
+        fill(typemax(T), n),
         SparseIndices(n))
 end
 
@@ -359,7 +363,7 @@ concretize_affects!(p::HybridTauJumpAggregation{T, S, F1, F2},
 function initialize!(p::HybridTauJumpAggregation, integrator, u, params, t)
     initialize!(p.exact, integrator, u, params, t)
     sync!(p)
-    recompute_rates!(p, p.ma_jumps, u, params, t)
+    compute_rates!(p, p.ma_jumps, u, params, t)
     open_window!(p, integrator, u, params, t)
     generate_jumps!(p, integrator, u, params, t)
 end
@@ -376,8 +380,8 @@ end
 
 function open_window!(p, integrator, u, params, t)
     refresh_rates!(p, p.ma_jumps, u, params, t)
-    τ = min(p.dt, tau_from_moments(u, p.μ, p.σ², p.χ, eachindex(u), p.max_hor,
-        p.max_stoich, t, p.epsilon, p.dtmin))
+    update_taus!(p, u, t, p.stale_taus)
+    τ = min(p.dt, max(minimum(p.taus), p.dtmin))
     draw_leap!(p, p.ma_jumps, τ)
     while !feasible(u, p.du, p.changed_specs)
         τ /= 2
@@ -418,20 +422,20 @@ advance_to!(integrator, p::HybridTauJumpAggregation, t) =
 
 refresh_rates!(p, ::Nothing, u, params, t) = nothing
 
-recompute_rates!(p, ::Nothing, u, params, t) = nothing
+compute_rates!(p, ::Nothing, u, params, t) = nothing
 
 jump_rate(p, m, j, u, params, t) = j <= get_num_majumps(m) ? evalrxrate(u, j, m.inner) :
                                    p.rates[j - get_num_majumps(m)](u, params, t)
 
-jump_stoich(p, m, j) = j <= get_num_majumps(m) ? m.net_stoch[j] :
-                       p.crj_stoich[j - get_num_majumps(m)]
+jump_stoich(p, m::BlendedMassActionJump, j) =
+    j <= get_num_majumps(m) ? m.net_stoch[j] : p.crj_stoich[j - get_num_majumps(m)]
 
-jump_leap_rate(p, m, j, u, a) = j <= get_num_majumps(m) ?
-                                (1 - blend(m.policy, m, j, u)) * a : 0.0
+jump_leap_rate(p, m::BlendedMassActionJump, j, u, a) =
+    j <= get_num_majumps(m) ? (1 - blend(m.policy, m, j, u)) * a : 0.0
 
 njumps(p) = length(p.rate)
 
-function recompute_rates!(p, m::BlendedMassActionJump, u, params, t)
+function compute_rates!(p, m::BlendedMassActionJump, u, params, t)
     (; leap_rate, rate, μ, σ², χ, self_stoch, ulast) = p
     fill!(μ, 0.0)
     fill!(σ², 0.0)
@@ -452,16 +456,25 @@ function recompute_rates!(p, m::BlendedMassActionJump, u, params, t)
         end
     end
     copyto!(ulast, u)
+    empty!(p.stale_taus)
+    @inbounds for i in eachindex(u)
+        push!(p.stale_taus, i)
+    end
     nothing
 end
 
 function refresh_rates!(p, m::BlendedMassActionJump, u, params, t)
-    p.vartojumps_map === nothing && return recompute_rates!(p, m, u, params, t)
-    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast, stale_rxs, vartojumps_map) = p
+    p.vartojumps_map === nothing && return compute_rates!(p, m, u, params, t)
+    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast, stale_rxs, vartojumps_map,
+       stale_taus) = p
     njs = njumps(p)
     empty!(stale_rxs)
+    empty!(stale_taus)
     @inbounds for i in eachindex(u)
         u[i] == ulast[i] && continue
+        push!(stale_taus, i)
+        gi = compute_gi(u, p.max_hor, p.max_stoich, i, t)
+        abs(u[i] - ulast[i]) <= 0.5 * p.epsilon * u[i] / gi && continue
         ulast[i] = u[i]
         for j in vartojumps_map[i]
             j <= njs && push!(stale_rxs, j)
@@ -476,21 +489,23 @@ function refresh_rates!(p, m::BlendedMassActionJump, u, params, t)
         for (spec, ν) in jump_stoich(p, m, j)
             μ[spec] += ν * d
             σ²[spec] += ν * ν * d
+            push!(stale_taus, spec)
         end
         if j <= get_num_majumps(m)
             for (spec, w) in self_stoch[j]
                 χ[spec] += w * d
+                push!(stale_taus, spec)
             end
         end
     end
     nothing
 end
 
-function tau_from_moments(u, μ, σ², χ, idxs, max_hor, max_stoich, t, epsilon, dtmin)
+function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
     τ = typemax(typeof(t))
-    @inbounds for i in idxs
+    @inbounds begin
         gi = compute_gi(u, max_hor, max_stoich, i, t)
-        bound = max(epsilon * u[i] / gi, one(eltype(u)))
+        bound = max(epsilon * u[i] / gi - abs(u[i] - ulast[i]), one(eltype(u)))
         m = abs(μ[i])
         m > 0 && (τ = min(τ, bound / m))
         s = σ²[i]
@@ -503,7 +518,15 @@ function tau_from_moments(u, μ, σ², χ, idxs, max_hor, max_stoich, t, epsilon
         f = abs(χ[i])
         f > 0 && (τ = min(τ, max(u[i], one(eltype(u))) / f))
     end
-    max(τ, dtmin)
+    τ
+end
+
+function update_taus!(p, u, t, idxs)
+    (; taus, ulast, μ, σ², χ, max_hor, max_stoich, epsilon) = p
+    @inbounds for i in idxs
+        taus[i] = tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
+    end
+    nothing
 end
 
 draw_leap!(p, ::Nothing, τ) = nothing
