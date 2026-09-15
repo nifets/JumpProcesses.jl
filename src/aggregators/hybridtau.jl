@@ -31,35 +31,40 @@ struct BlendedMassActionJump{M, P} <: AbstractMassActionJump
     policy::P
 end
 
-function Base.getproperty(m::BlendedMassActionJump, f::Symbol)
-    (f === :inner || f === :policy) && return getfield(m, f)
-    getproperty(getfield(m, :inner), f)
+function Base.getproperty(maj::BlendedMassActionJump, f::Symbol)
+    (f === :inner || f === :policy) && return getfield(maj, f)
+    getproperty(getfield(maj, :inner), f)
 end
 
-Base.propertynames(m::BlendedMassActionJump) =
-    (:inner, :policy, propertynames(getfield(m, :inner))...)
+Base.propertynames(maj::BlendedMassActionJump) =
+    (:inner, :policy, propertynames(getfield(maj, :inner))...)
 
-get_num_majumps(m::BlendedMassActionJump) = get_num_majumps(m.inner)
-
-using_params(m::BlendedMassActionJump) = using_params(m.inner)
-
-update_parameters!(m::BlendedMassActionJump, newparams; kwargs...) =
-    update_parameters!(m.inner, newparams; kwargs...)
-
-function firings_left(m, i, u)
-    L = typemax(Int)
-    @inbounds for (spec, change) in m.net_stoch[i]
-        change < 0 && (L = min(L, floor(Int, u[spec] / -change)))
-    end
-    L
+struct ConstantJumpStoich{NS, OS}
+    net_stoch::NS
+    order::OS
 end
 
-function self_stoich(maj, nrx)
-    map(1:nrx) do j
+jump_stoich(maj, crj_stoich, j) =
+    j <= get_num_majumps(maj) ? maj.net_stoch[j] :
+    crj_stoich.net_stoch[j - get_num_majumps(maj)]
+
+jump_order(maj, crj_stoich, j) =
+    j <= get_num_majumps(maj) ? maj.reactant_stoch[j] :
+    (crj_stoich.order === nothing ? () : crj_stoich.order[j - get_num_majumps(maj)])
+
+get_num_majumps(maj::BlendedMassActionJump) = get_num_majumps(maj.inner)
+
+using_params(maj::BlendedMassActionJump) = using_params(maj.inner)
+
+update_parameters!(maj::BlendedMassActionJump, newparams; kwargs...) =
+    update_parameters!(maj.inner, newparams; kwargs...)
+
+function self_stoich(maj, crj_stoich, njs)
+    map(1:njs) do j
         w = Pair{Int, Float64}[]
-        for (spec, o) in maj.reactant_stoch[j]
+        for (spec, o) in jump_order(maj, crj_stoich, j)
             stoch = 0
-            for (s, n) in maj.net_stoch[j]
+            for (s, n) in jump_stoich(maj, crj_stoich, j)
                 s == spec && (stoch = n)
             end
             iszero(stoch) || push!(w, spec => float(stoch * o))
@@ -68,15 +73,51 @@ function self_stoich(maj, nrx)
     end
 end
 
-@inline function evalrxrate(u::AbstractVector{V}, i, m::BlendedMassActionJump) where {V <: Real}
-    β = blend(m.policy, m, i, u)
-    iszero(β) && return zero(eltype(m.scaled_rates))
-    β * evalrxrate(u, i, m.inner)
+function species_orders(maj, crj_stoich, nspec, njs)
+    max_hor = zeros(Float64, nspec)
+    max_stoich = ones(Int, nspec)
+    nmaj = get_num_majumps(maj)
+    for j in 1:njs
+        order = jump_order(maj, crj_stoich, j)
+        h = 0.0
+        for (_, o) in order
+            h += float(o)
+        end
+        for (spec, o) in order
+            max_hor[spec] = max(max_hor[spec], h)
+            max_stoich[spec] = max(max_stoich[spec], j <= nmaj ? Int(o) : 1)
+        end
+    end
+    max_hor, max_stoich
 end
 
-@inline function get_majump_brackets(ulow, uhigh, k, m::BlendedMassActionJump)
-    alow, ahigh = get_majump_brackets(ulow, uhigh, k, m.inner)
-    blend(m.policy, m, k, uhigh) * alow, blend(m.policy, m, k, ulow) * ahigh
+function effective_gi(u, max_hor, max_stoich, i)
+    @inbounds h = max_hor[i]
+    h <= 1 && return 1.0
+    @inbounds k = max_stoich[i]
+    k <= 1 && return h
+    @inbounds x = float(u[i])
+    acc = 0.0
+    for r in 0:(k - 1)
+        d = x - r
+        d <= 0 && return h
+        acc += x / d
+    end
+    (h / k) * acc
+end
+
+@inline function evalrxrate(u::AbstractVector{V}, i,
+        maj::BlendedMassActionJump) where {V <: Real}
+    β = blend(maj.policy, maj.net_stoch[i], maj.reactant_stoch[i], u)
+    iszero(β) && return zero(eltype(maj.scaled_rates))
+    β * evalrxrate(u, i, maj.inner)
+end
+
+@inline function get_majump_brackets(ulow, uhigh, k, maj::BlendedMassActionJump)
+    alow, ahigh = get_majump_brackets(ulow, uhigh, k, maj.inner)
+    net_stoch, order = maj.net_stoch[k], maj.reactant_stoch[k]
+    blend(maj.policy, net_stoch, order, uhigh) * alow,
+    blend(maj.policy, net_stoch, order, ulow) * ahigh
 end
 
 struct BlendedBracketData{B, T}
@@ -115,44 +156,70 @@ struct CriticalBlend{T} <: BlendingPolicy
 end
 CriticalBlend() = CriticalBlend(10)
 
-function blend(policy::CriticalBlend, m, i, u)
-    @inbounds for (spec, change) in m.net_stoch[i]
+function blend(policy::CriticalBlend, net_stoch, order, u)
+    @inbounds for (spec, change) in net_stoch
         change < 0 && u[spec] < float(policy.nc) * (-change) && return 1.0
     end
-    @inbounds for (spec, order) in m.reactant_stoch[i]
-        u[spec] < float(policy.nc) * order && return 1.0
+    @inbounds for (spec, o) in order
+        u[spec] < float(policy.nc) * o && return 1.0
     end
     0.0
 end
 
-function blend_thresholds(policy::CriticalBlend, maj, nspec, ::Type{T}) where{T}
+function blend_thresholds(policy::CriticalBlend, maj, crj_stoich, njs, nspec,
+        ::Type{T}) where{T}
     thr = [T[] for _ in 1:nspec]
-    for j in 1:get_num_majumps(maj)
-        for (spec, change) in maj.net_stoch[j]
+    for j in 1:njs
+        for (spec, change) in jump_stoich(maj, crj_stoich, j)
             change < 0 && push!(thr[spec], ceil(T, float(policy.nc) * (-change)))
         end
-        for (spec, order) in maj.reactant_stoch[j]
-            push!(thr[spec], ceil(T, float(policy.nc) * order))
+        for (spec, o) in jump_order(maj, crj_stoich, j)
+            push!(thr[spec], ceil(T, float(policy.nc) * o))
         end
     end
     foreach(v -> unique!(sort!(v)), thr)
     thr
 end
 
+function blended_crj(policy, crj_stoich, c, k)
+    net_stoch = crj_stoich.net_stoch[k]
+    order = crj_stoich.order === nothing ? () : crj_stoich.order[k]
+    β(u) = blend(policy, net_stoch, order, u)
+    rate = (u, p, t) -> β(u) * c.rate(u, p, t)
+    bounds = hasbounds(c) ?
+        (ulow, uhigh, u, p, t) -> begin
+            b = c.bounds.bounds(ulow, uhigh, u, p, t)
+            (; lrate = β(uhigh) * b.lrate, urate = β(ulow) * b.urate)
+        end : nothing
+    lrate = haslrate(c) ?
+        (ulow, uhigh, u, p, t) ->
+            (; lrate = β(uhigh) * c.bounds.lrate(ulow, uhigh, u, p, t).lrate) : nothing
+    urate = hasurate(c) ?
+        (ulow, uhigh, u, p, t) ->
+            (; urate = β(ulow) * c.bounds.urate(ulow, uhigh, u, p, t).urate) : nothing
+    ConstantRateJump(rate, c.affect!,
+        bounds === nothing && lrate === nothing && urate === nothing ? nothing :
+        RateBoundFunctions(bounds, lrate, urate))
+end
+
 struct AlwaysLeap <: BlendingPolicy end
 
-blend(::AlwaysLeap, m, i, u) = 0.0
+blended_crj(::AlwaysLeap, crj_stoich, c, k) =
+    ConstantRateJump((u, p, t) -> 0.0, c.affect!, nothing)
 
-blend_thresholds(::AlwaysLeap, maj, nspec, ::Type{T}) where {T} = [T[] for _ in 1:nspec]
+blend(::AlwaysLeap, net_stoch, order, u) = 0.0
+
+blend_thresholds(::AlwaysLeap, maj, crj_stoich, njs, nspec,
+    ::Type{T}) where {T} = [T[] for _ in 1:nspec]
 
 @inline function evalrxrate(u::AbstractVector{V}, i,
-    m::BlendedMassActionJump{<:Any, AlwaysLeap}) where {V <: Real}
-    zero(eltype(m.scaled_rates))
+    maj::BlendedMassActionJump{<:Any, AlwaysLeap}) where {V <: Real}
+    zero(eltype(maj.scaled_rates))
 end
 
 @inline function get_majump_brackets(ulow, uhigh, k,
-    m::BlendedMassActionJump{<:Any, AlwaysLeap})
-    R = eltype(m.scaled_rates)
+    maj::BlendedMassActionJump{<:Any, AlwaysLeap})
+    R = eltype(maj.scaled_rates)
     zero(R), zero(R)
 end
 
@@ -163,12 +230,13 @@ struct LinearBlend{T} <: BlendingPolicy
 end
 LinearBlend() = LinearBlend(10, 100)
 
-function blend_thresholds(policy::LinearBlend, maj, nspec, ::Type{T}) where {T}
+function blend_thresholds(policy::LinearBlend, maj, crj_stoich, njs, nspec,
+        ::Type{T}) where {T}
     thr = [T[] for _ in 1:nspec]
     lo = ceil(T, policy.lower)
     hi = ceil(T, policy.upper)
-    for j in 1:get_num_majumps(maj)
-        for stoch in (maj.reactant_stoch[j], maj.net_stoch[j])
+    for j in 1:njs
+        for stoch in (jump_order(maj, crj_stoich, j), jump_stoich(maj, crj_stoich, j))
             for (spec, _) in stoch
                 push!(thr[spec], lo, hi)
             end
@@ -178,19 +246,19 @@ function blend_thresholds(policy::LinearBlend, maj, nspec, ::Type{T}) where {T}
     thr
 end
 
-function involved_min(m, i, u)
+function involved_min(net_stoch, order, u)
     x = Inf
-    @inbounds for (spec, _) in m.reactant_stoch[i]
+    @inbounds for (spec, _) in order
         x = min(x, u[spec])
     end
-    @inbounds for (spec, _) in m.net_stoch[i]
+    @inbounds for (spec, _) in net_stoch
         x = min(x, u[spec])
     end
     x
 end
 
-function blend(policy::LinearBlend, m, i, u)
-    x = involved_min(m, i, u)
+function blend(policy::LinearBlend, net_stoch, order, u)
+    x = involved_min(net_stoch, order, u)
     x <= policy.lower && return 1.0
     x >= policy.upper && return 0.0
     (policy.upper - x) / (policy.upper - policy.lower)
@@ -199,7 +267,7 @@ end
 
 ############################################################
 
-mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, CS} <:
+mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C} <:
     AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     # aggregator interface
     next_jump::Int
@@ -213,7 +281,7 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, CS} <:
     rng::RNG
     exact::A
     policy::P
-    crj_stoich::CS
+    crj_stoich::C
     # windowing
     dt::T
     dtmin::T
@@ -225,7 +293,7 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, CS} <:
     σ²::Vector{Float64}
     χ::Vector{Float64}
     self_stoch::Vector{Vector{Pair{Int, Float64}}}
-    max_hor::Vector{Int}
+    max_hor::Vector{Float64}
     max_stoich::Vector{Int}
     # rate caches
     rate::Vector{Float64}
@@ -244,19 +312,18 @@ end
 
 
 function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG},
-        policy, dt, epsilon, du, counts, vtoj, max_hor, max_stoich, self_stoch,
-        crj_stoich) where {T,S,F1,F2,RNG}
+        policy, dt, epsilon, du, nmaj, vtoj, max_hor, max_stoich, self_stoch,
+        crj_stoich, rates) where {T,S,F1,F2,RNG}
     n = length(du)
-    nmaj = length(counts)
-    njs = nmaj + (crj_stoich === nothing ? 0 : length(crj_stoich))
-    HybridTauJumpAggregation{T, S, F1, F2, RNG, typeof(inner), typeof(policy), typeof(du),
-        typeof(vtoj), typeof(crj_stoich)}(
+    njs = nmaj + (crj_stoich === nothing ? 0 : length(crj_stoich.net_stoch))
+    HybridTauJumpAggregation{T, S, typeof(rates), F2, RNG, typeof(inner), typeof(policy),
+        typeof(du), typeof(vtoj), typeof(crj_stoich)}(
         inner.next_jump,
         inner.prev_jump,
         inner.next_jump_time,
         inner.end_time,
         inner.ma_jumps,
-        inner.rates,
+        rates,
         inner.affects!,
         inner.save_positions,
         inner.rng,
@@ -275,12 +342,12 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         max_hor,
         max_stoich,
         zeros(njs),
-        zeros(nmaj),
+        zeros(njs),
         zero(du),
         SparseIndices(njs),
         vtoj,
         SparseIndices(njs),
-        counts,
+        zeros(Int, njs),
         du,
         SparseIndices(n),
         fill(typemax(T), n),
@@ -289,36 +356,40 @@ end
 
 function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_jumps,
         save_positions, rng; kwargs...)
+    net_stoch = get(kwargs, :crj_stoich, nothing)
+    crj_stoich = net_stoch === nothing ? nothing :
+                 ConstantJumpStoich(net_stoch, get(kwargs, :crj_order, nothing))
+    ncrj = net_stoch === nothing ? 0 : length(net_stoch)
     maj = ma_jumps === nothing ? nothing :
           BlendedMassActionJump(ma_jumps, aggregator.policy)
-    nrx = maj === nothing ? 0 : get_num_majumps(maj)
-    if maj === nothing
-        max_hor = Int[]; max_stoich = Int[]
-        selfs = Vector{Pair{Int, Float64}}[]
-    else
-        hor = compute_hor(maj.reactant_stoch, nrx)
-        max_hor, max_stoich = precompute_reaction_conditions(maj.reactant_stoch, hor, length(u), nrx)
-        selfs = self_stoich(maj, nrx)
-    end
+    nrx = get_num_majumps(maj)
+    njs = nrx + ncrj
+    max_hor, max_stoich = species_orders(maj, crj_stoich, length(u), njs)
+    selfs = self_stoich(maj, crj_stoich, njs)
     kw = values(kwargs)
-    if maj !== nothing && needs_bracketing(aggregator.exact)
+    if njs > 0 && needs_bracketing(aggregator.exact)
         base = get(kw, :bracket_data, nothing)
         base === nothing && (base = BracketData{eltype(u) <: Integer ? Float64 : eltype(u),
                                                 eltype(u)}())
         bd = BlendedBracketData(base,
-            blend_thresholds(aggregator.policy, maj, length(u), eltype(u)))
+            blend_thresholds(aggregator.policy, maj, crj_stoich, njs,
+                length(u), eltype(u)))
         kw = merge(kw, (; bracket_data = bd))
     end
 
-    inner = aggregate(aggregator.exact, u, p, t, end_time, constant_jumps, maj,
+    leap_rates, _ = get_jump_info_fwrappers(u, p, t, constant_jumps)
+    exact_jumps = (crj_stoich === nothing || constant_jumps === nothing ||
+                   isempty(constant_jumps)) ? constant_jumps :
+        [blended_crj(aggregator.policy, crj_stoich, c, k)
+         for (k, c) in enumerate(constant_jumps)]
+    inner = aggregate(aggregator.exact, u, p, t, end_time, exact_jumps, maj,
         save_positions, rng; kw...)
     vtoj = get(kwargs, :vartojumps_map, nothing)
     if vtoj === nothing && maj !== nothing && isempty(constant_jumps)
         vtoj = var_to_jumps_map(length(u), maj)
     end
     HybridTauJumpAggregation(inner, aggregator.policy, aggregator.dt, aggregator.epsilon,
-        zero(u), zeros(Int, nrx), vtoj, max_hor, max_stoich, selfs,
-        get(kwargs, :crj_stoich, nothing))
+        zero(u), nrx, vtoj, max_hor, max_stoich, selfs, crj_stoich, leap_rates)
 end
 
 # this is only needed because we're implementing the aggregator interface
@@ -363,7 +434,7 @@ concretize_affects!(p::HybridTauJumpAggregation{T, S, F1, F2},
 function initialize!(p::HybridTauJumpAggregation, integrator, u, params, t)
     initialize!(p.exact, integrator, u, params, t)
     sync!(p)
-    compute_rates!(p, p.ma_jumps, u, params, t)
+    compute_rates!(p, u, params, t)
     open_window!(p, integrator, u, params, t)
     generate_jumps!(p, integrator, u, params, t)
 end
@@ -378,11 +449,13 @@ function execute_jumps!(p::HybridTauJumpAggregation, integrator, u, params, t, a
     nothing
 end
 
+leaps_everything(p) = p.policy isa AlwaysLeap && p.crj_stoich !== nothing
+
 function open_window!(p, integrator, u, params, t)
-    refresh_rates!(p, p.ma_jumps, u, params, t)
+    refresh_rates!(p, u, params, t)
     update_taus!(p, u, t, p.stale_taus)
     τ = min(p.dt, max(minimum(p.taus), p.dtmin))
-    draw_leap!(p, p.ma_jumps, τ)
+    draw_leap!(p, τ)
     while !feasible(u, p.du, p.changed_specs)
         τ /= 2
         if τ <= p.dtmin
@@ -392,17 +465,23 @@ function open_window!(p, integrator, u, params, t)
             DiffEqBase.terminate!(integrator, ReturnCode.Failure)
             break
         end
-        thin_leap!(p, p.ma_jumps, 0.5)
+        thin_leap!(p, 0.5)
     end
     @inbounds for i in p.changed_specs
         u[i] += p.du[i]
     end
-    isempty(p.changed_specs) || update_exact_rates!(p.exact, p, u, params, t)
+    leaps_everything(p) || isempty(p.changed_specs) ||
+        update_exact_rates!(p.exact, p, u, params, t)
     p.window_end = t + τ
     nothing
 end
 
 function generate_jumps!(p::HybridTauJumpAggregation, integrator, u, params, t)
+    if leaps_everything(p)
+        p.next_jump_time = p.window_end
+        p.exact_due = false
+        return nothing
+    end
     generate_jumps!(p.exact, integrator, u, params, t)
     sync!(p)
     p.next_jump_time = min(p.exact.next_jump_time, p.window_end)
@@ -420,82 +499,76 @@ end
 advance_to!(integrator, p::HybridTauJumpAggregation, t) =
     advance_to!(integrator, p.exact, t)
 
-refresh_rates!(p, ::Nothing, u, params, t) = nothing
+jump_rate(p, maj, j, u, params, t) =
+    j <= get_num_majumps(maj) ? evalrxrate(u, j, maj.inner) :
+    p.rates[j - get_num_majumps(maj)](u, params, t)
 
-compute_rates!(p, ::Nothing, u, params, t) = nothing
-
-jump_rate(p, m, j, u, params, t) = j <= get_num_majumps(m) ? evalrxrate(u, j, m.inner) :
-                                   p.rates[j - get_num_majumps(m)](u, params, t)
-
-jump_stoich(p, m::BlendedMassActionJump, j) =
-    j <= get_num_majumps(m) ? m.net_stoch[j] : p.crj_stoich[j - get_num_majumps(m)]
-
-jump_leap_rate(p, m::BlendedMassActionJump, j, u, a) =
-    j <= get_num_majumps(m) ? (1 - blend(m.policy, m, j, u)) * a : 0.0
+jump_leap_rate(policy, net_stoch, order, u, a) =
+    (1 - blend(policy, net_stoch, order, u)) * a
 
 njumps(p) = length(p.rate)
 
-function compute_rates!(p, m::BlendedMassActionJump, u, params, t)
-    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast) = p
+function compute_rates!(p, u, params, t)
+    (; ma_jumps, crj_stoich, policy, leap_rate, rate, μ, σ², χ, self_stoch,
+       ulast, stale_taus) = p
     fill!(μ, 0.0)
     fill!(σ², 0.0)
     fill!(χ, 0.0)
     @inbounds for j in 1:njumps(p)
-        a = jump_rate(p, m, j, u, params, t)
+        net_stoch = jump_stoich(ma_jumps, crj_stoich, j)
+        a = jump_rate(p, ma_jumps, j, u, params, t)
         rate[j] = a
-        j <= get_num_majumps(m) && (leap_rate[j] = jump_leap_rate(p, m, j, u, a))
+        leap_rate[j] = jump_leap_rate(policy, net_stoch,
+            jump_order(ma_jumps, crj_stoich, j), u, a)
         iszero(a) && continue
-        for (spec, ν) in jump_stoich(p, m, j)
+        for (spec, ν) in net_stoch
             μ[spec] += ν * a
             σ²[spec] += ν * ν * a
         end
-        if j <= get_num_majumps(m)
-            for (spec, w) in self_stoch[j]
-                χ[spec] += w * a
-            end
+        for (spec, w) in self_stoch[j]
+            χ[spec] += w * a
         end
     end
     copyto!(ulast, u)
-    empty!(p.stale_taus)
+    empty!(stale_taus)
     @inbounds for i in eachindex(u)
-        push!(p.stale_taus, i)
+        push!(stale_taus, i)
     end
     nothing
 end
 
-function refresh_rates!(p, m::BlendedMassActionJump, u, params, t)
-    p.vartojumps_map === nothing && return compute_rates!(p, m, u, params, t)
-    (; leap_rate, rate, μ, σ², χ, self_stoch, ulast, stale_rxs, vartojumps_map,
-       stale_taus) = p
+function refresh_rates!(p, u, params, t)
+    p.vartojumps_map === nothing && return compute_rates!(p, u, params, t)
+    (; ma_jumps, crj_stoich, policy, leap_rate, rate, μ, σ², χ, self_stoch,
+       ulast, stale_rxs, vartojumps_map, stale_taus, max_hor, max_stoich, epsilon) = p
     njs = njumps(p)
     empty!(stale_rxs)
-    empty!(stale_taus)
     @inbounds for i in eachindex(u)
         u[i] == ulast[i] && continue
         push!(stale_taus, i)
-        gi = compute_gi(u, p.max_hor, p.max_stoich, i, t)
-        abs(u[i] - ulast[i]) <= 0.5 * p.epsilon * u[i] / gi && continue
+        gi = effective_gi(u, max_hor, max_stoich, i)
+        abs(u[i] - ulast[i]) <= 0.5 * epsilon * u[i] / gi && continue
         ulast[i] = u[i]
         for j in vartojumps_map[i]
             j <= njs && push!(stale_rxs, j)
         end
     end
     @inbounds for j in stale_rxs
-        a = jump_rate(p, m, j, u, params, t)
+        net_stoch = jump_stoich(ma_jumps, crj_stoich, j)
+        a = jump_rate(p, ma_jumps, j, u, params, t)
         d = a - rate[j]
         rate[j] = a
-        j <= get_num_majumps(m) && (leap_rate[j] = jump_leap_rate(p, m, j, u, a))
+        leap_rate[j] = jump_leap_rate(policy, net_stoch,
+            jump_order(ma_jumps, crj_stoich, j), u, a)
         iszero(d) && continue
-        for (spec, ν) in jump_stoich(p, m, j)
+        for (spec, ν) in net_stoch
             μ[spec] += ν * d
             σ²[spec] += ν * ν * d
             push!(stale_taus, spec)
         end
-        if j <= get_num_majumps(m)
-            for (spec, w) in self_stoch[j]
-                χ[spec] += w * d
-                push!(stale_taus, spec)
-            end
+        for (spec, w) in self_stoch[j]
+            χ[spec] += w * d
+            push!(stale_taus, spec)
         end
     end
     nothing
@@ -504,7 +577,7 @@ end
 function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
     τ = typemax(typeof(t))
     @inbounds begin
-        gi = compute_gi(u, max_hor, max_stoich, i, t)
+        gi = effective_gi(u, max_hor, max_stoich, i)
         bound = max(epsilon * u[i] / gi - abs(u[i] - ulast[i]), one(eltype(u)))
         m = abs(μ[i])
         m > 0 && (τ = min(τ, bound / m))
@@ -526,40 +599,37 @@ function update_taus!(p, u, t, idxs)
     @inbounds for i in idxs
         taus[i] = tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
     end
+    empty!(idxs)
     nothing
 end
 
-draw_leap!(p, ::Nothing, τ) = nothing
-
-function draw_leap!(p, m::BlendedMassActionJump, τ)
-    (; leap_rate, counts, du, changed_specs, rng) = p
+function draw_leap!(p, τ)
+    (; ma_jumps, crj_stoich, leap_rate, counts, du, changed_specs, rng) = p
     @inbounds for i in changed_specs
         du[i] = zero(eltype(du))
     end
     empty!(changed_specs)
-    @inbounds for j in 1:get_num_majumps(m)
+    @inbounds for j in 1:njumps(p)
         λ = leap_rate[j] * τ
         counts[j] = λ > 0 ? pois_rand(rng, λ) : 0
         iszero(counts[j]) && continue
-        for (spec, stoch) in m.net_stoch[j]
+        for (spec, stoch) in jump_stoich(ma_jumps, crj_stoich, j)
             du[spec] += stoch * counts[j]
             push!(changed_specs, spec)
         end
     end
 end
 
-thin_leap!(p, ::Nothing, r) = nothing
-
-function thin_leap!(p, m::BlendedMassActionJump, r)
-    (; counts, du, changed_specs, rng) = p
+function thin_leap!(p, r)
+    (; ma_jumps, crj_stoich, counts, du, changed_specs, rng) = p
     @inbounds for i in changed_specs
         du[i] = zero(eltype(du))
     end
     empty!(changed_specs)
-    @inbounds for j in 1:get_num_majumps(m)
+    @inbounds for j in 1:njumps(p)
         counts[j] = counts[j] > 0 ? binom_rand(rng, counts[j], r) : 0
         iszero(counts[j]) && continue
-        for (spec, stoch) in m.net_stoch[j]
+        for (spec, stoch) in jump_stoich(ma_jumps, crj_stoich, j)
             du[spec] += stoch * counts[j]
             push!(changed_specs, spec)
         end
