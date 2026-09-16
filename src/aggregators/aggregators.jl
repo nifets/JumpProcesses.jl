@@ -189,9 +189,10 @@ struct HybridTau{A, B, S} <: AbstractAggregatorAlgorithm
     thin_negative::Bool
 end
 HybridTau(exact, policy = CriticalBlend(10), dt = Inf; epsilon = 0.05,
-        thin_negative = true) =
+        thin_negative = true, chi = true, quantile = 0) =
     HybridTau(exact, policy,
-        epsilon === nothing ? FixedTau(dt) : AdaptiveTau(promote(epsilon, dt)...),
+        epsilon === nothing ? FixedTau(dt) :
+        AdaptiveTau(epsilon, dt; chi, quantile),
         thin_negative)
 
 # For JumpProblem construction without an aggregator
