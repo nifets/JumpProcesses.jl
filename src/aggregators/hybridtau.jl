@@ -148,9 +148,15 @@ function get_spec_brackets(bd::BlendedBracketData, i, u::Number)
     lo, hi
 end
 
-struct AdaptiveTau{T}
+struct AdaptiveTau{T, X}
     epsilon::T
     cap::T
+    quantile::T
+end
+function AdaptiveTau(epsilon, cap; chi::Bool = true, quantile = 0)
+    e, c, q = promote(epsilon, cap, quantile)
+    0 <= q < 1 || error("AdaptiveTau quantile must lie in [0, 1); got $q.")
+    AdaptiveTau{typeof(e), chi}(e, c, q)
 end
 
 struct FixedTau{T}
@@ -162,8 +168,56 @@ function FixedTau(dt, epsilon = 0.05)
     FixedTau(promote(dt, epsilon)...)
 end
 
+uses_chi(::AdaptiveTau{T, X}) where {T, X} = X
+uses_chi(::FixedTau) = false
+
+struct MinReduce end
+
+struct TopKReduce{T}
+    quantile::T
+    heap::Vector{T}
+end
+
+reducer(tau, ::Type{T}) where {T} = MinReduce()
+reducer(tau::AdaptiveTau, ::Type{T}) where {T} =
+    iszero(tau.quantile) ? MinReduce() : TopKReduce(T(tau.quantile), T[])
+
+(::MinReduce)(xs) = minimum(xs)
+
+function sift_down!(heap, i, n)
+    @inbounds while true
+        l = 2i
+        l > n && break
+        c = l < n && heap[l + 1] > heap[l] ? l + 1 : l
+        heap[c] <= heap[i] && break
+        heap[i], heap[c] = heap[c], heap[i]
+        i = c
+    end
+end
+
+function (r::TopKReduce)(xs)
+    n = length(xs)
+    k = clamp(ceil(Int, r.quantile * n), 1, n)
+    k == 1 && return minimum(xs)
+    heap = r.heap
+    length(heap) == k || resize!(heap, k)
+    @inbounds for i in 1:k
+        heap[i] = xs[i]
+    end
+    for i in (k ÷ 2):-1:1
+        sift_down!(heap, i, k)
+    end
+    @inbounds for i in (k + 1):n
+        xs[i] < heap[1] || continue
+        heap[1] = xs[i]
+        sift_down!(heap, 1, k)
+    end
+    @inbounds heap[1]
+end
+
 select_tau(sel::FixedTau, p) = sel.dt
-select_tau(sel::AdaptiveTau, p) = min(sel.cap, max(minimum(p.taus), p.dtmin))
+select_tau(sel::AdaptiveTau, p) =
+    min(sel.cap, max(p.taureduce(p.taus), p.dtmin))
 
 needs_moments(::AdaptiveTau) = true
 needs_moments(::FixedTau) = false
@@ -187,12 +241,15 @@ struct CriticalBlend{T} <: BlendingPolicy
 end
 CriticalBlend() = CriticalBlend(10)
 
+nc_for(nc::Number, spec) = float(nc)
+nc_for(nc::AbstractVector, spec) = @inbounds float(nc[spec])
+
 function blend(policy::CriticalBlend, net_stoch, order, u)
     @inbounds for (spec, change) in net_stoch
-        change < 0 && u[spec] < float(policy.nc) * (-change) && return 1.0
+        change < 0 && u[spec] < nc_for(policy.nc, spec) * (-change) && return 1.0
     end
     @inbounds for (spec, o) in order
-        u[spec] < float(policy.nc) * o && return 1.0
+        u[spec] < nc_for(policy.nc, spec) * o && return 1.0
     end
     0.0
 end
@@ -202,10 +259,11 @@ function blend_thresholds(policy::CriticalBlend, maj, crj_stoich, njs, nspec,
     thr = [T[] for _ in 1:nspec]
     for j in 1:njs
         for (spec, change) in jump_stoich(maj, crj_stoich, j)
-            change < 0 && push!(thr[spec], ceil(T, float(policy.nc) * (-change)))
+            change < 0 &&
+                push!(thr[spec], ceil(T, nc_for(policy.nc, spec) * (-change)))
         end
         for (spec, o) in jump_order(maj, crj_stoich, j)
-            push!(thr[spec], ceil(T, float(policy.nc) * o))
+            push!(thr[spec], ceil(T, nc_for(policy.nc, spec) * o))
         end
     end
     foreach(v -> unique!(sort!(v)), thr)
@@ -298,7 +356,7 @@ end
 
 ############################################################
 
-mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C, TS, CS} <:
+mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C, TS, CS, R} <:
     AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     # aggregator interface
     next_jump::Int
@@ -338,6 +396,7 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C, TS, C
     du::U
     changed_specs::CS
     taus::Vector{T}
+    taureduce::R
     stale_taus::SparseIndices
 end
 
@@ -349,9 +408,10 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
     njs = nmaj + (crj_stoich === nothing ? 0 : length(crj_stoich.net_stoch))
     changed_specs = policy isa AlwaysLeap && crj_stoich !== nothing ?
                     DenseIndices(n) : SparseIndices(n)
+    taureduce = reducer(tau, T)
     HybridTauJumpAggregation{T, S, typeof(rates), F2, RNG, typeof(inner), typeof(policy),
         typeof(du), typeof(vtoj), typeof(crj_stoich), typeof(tau),
-        typeof(changed_specs)}(
+        typeof(changed_specs), typeof(taureduce)}(
         inner.next_jump,
         inner.prev_jump,
         inner.next_jump_time,
@@ -385,6 +445,7 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         du,
         changed_specs,
         fill(typemax(T), n),
+        taureduce,
         SparseIndices(n))
 end
 
@@ -549,10 +610,11 @@ function compute_rates!(p, u, params, t)
     (; ma_jumps, crj_stoich, policy, leap_rate, rate, μ, σ², χ, self_stoch,
        ulast, stale_taus, tau) = p
     moments = needs_moments(tau)
+    usechi = uses_chi(tau)
     if moments
         fill!(μ, 0.0)
         fill!(σ², 0.0)
-        fill!(χ, 0.0)
+        usechi && fill!(χ, 0.0)
     end
     @inbounds for j in 1:njumps(p)
         net_stoch = jump_stoich(ma_jumps, crj_stoich, j)
@@ -565,8 +627,10 @@ function compute_rates!(p, u, params, t)
             μ[spec] += ν * a
             σ²[spec] += ν * ν * a
         end
-        for (spec, w) in self_stoch[j]
-            χ[spec] += w * a
+        if usechi
+            for (spec, w) in self_stoch[j]
+                χ[spec] += w * a
+            end
         end
     end
     copyto!(ulast, u)
@@ -585,6 +649,7 @@ function refresh_rates!(p, u, params, t)
        ulast, stale_rxs, vartojumps_map, stale_taus, max_hor, max_stoich, tau) = p
     njs = njumps(p)
     moments = needs_moments(tau)
+    usechi = uses_chi(tau)
     epsilon = tau.epsilon
     empty!(stale_rxs)
     @inbounds for i in eachindex(u)
@@ -610,15 +675,18 @@ function refresh_rates!(p, u, params, t)
             σ²[spec] += ν * ν * d
             push!(stale_taus, spec)
         end
-        for (spec, w) in self_stoch[j]
-            χ[spec] += w * d
-            push!(stale_taus, spec)
+        if usechi
+            for (spec, w) in self_stoch[j]
+                χ[spec] += w * d
+                push!(stale_taus, spec)
+            end
         end
     end
     nothing
 end
 
-function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
+function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, tau)
+    epsilon = tau.epsilon
     τ = typemax(typeof(t))
     @inbounds begin
         gi = effective_gi(u, max_hor, max_stoich, i)
@@ -632,17 +700,18 @@ function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsi
         # i.e. τ < 2 / max{λ} where λ are the e-values of the linearisation
         # to avoid computing the full Jacobian, we can use the diagonal entries as an approximation, halving by two to be conservative
         # Jᵢᵢ = Σⱼ νᵢⱼ·∂aⱼ/∂xᵢ = Σⱼ νᵢⱼ·oᵢⱼ·aⱼ/xᵢ = χ[i]/u[i]
-        f = abs(χ[i])
-        f > 0 && (τ = min(τ, max(u[i], one(eltype(u))) / f))
+        if uses_chi(tau)
+            f = abs(χ[i])
+            f > 0 && (τ = min(τ, max(u[i], one(eltype(u))) / f))
+        end
     end
     τ
 end
 
 function update_taus!(p, u, t, idxs)
     (; taus, ulast, μ, σ², χ, max_hor, max_stoich, tau) = p
-    epsilon = tau.epsilon
     @inbounds for i in idxs
-        taus[i] = tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
+        taus[i] = tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, tau)
     end
     empty!(idxs)
     nothing
