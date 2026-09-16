@@ -24,6 +24,17 @@ Base.isempty(s::SparseIndices) = isempty(s.idx)
 Base.length(s::SparseIndices) = length(s.idx)
 Base.eltype(::Type{SparseIndices}) = Int
 
+struct DenseIndices
+    n::Int
+end
+
+@inline Base.push!(s::DenseIndices, i) = s
+Base.empty!(s::DenseIndices) = s
+Base.iterate(s::DenseIndices, st = 1) = st > s.n ? nothing : (st, st + 1)
+Base.isempty(s::DenseIndices) = s.n == 0
+Base.length(s::DenseIndices) = s.n
+Base.eltype(::Type{DenseIndices}) = Int
+
 ##
 
 struct BlendedMassActionJump{M, P} <: AbstractMassActionJump
@@ -136,6 +147,26 @@ function get_spec_brackets(bd::BlendedBracketData, i, u::Number)
     end
     lo, hi
 end
+
+struct AdaptiveTau{T}
+    epsilon::T
+    cap::T
+end
+
+struct FixedTau{T}
+    dt::T
+    epsilon::T
+end
+function FixedTau(dt, epsilon = 0.05)
+    isfinite(dt) || error("FixedTau needs a finite step; got dt = $dt.")
+    FixedTau(promote(dt, epsilon)...)
+end
+
+select_tau(sel::FixedTau, p) = sel.dt
+select_tau(sel::AdaptiveTau, p) = min(sel.cap, max(minimum(p.taus), p.dtmin))
+
+needs_moments(::AdaptiveTau) = true
+needs_moments(::FixedTau) = false
 
 abstract type BlendingPolicy end
 
@@ -267,7 +298,7 @@ end
 
 ############################################################
 
-mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C} <:
+mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C, TS, CS} <:
     AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     # aggregator interface
     next_jump::Int
@@ -283,9 +314,9 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C} <:
     policy::P
     crj_stoich::C
     # windowing
-    dt::T
+    tau::TS
+    thin_negative::Bool
     dtmin::T
-    epsilon::T
     window_end::T
     exact_due::Bool
     # tau selection
@@ -305,19 +336,22 @@ mutable struct HybridTauJumpAggregation{T, S, F1, F2, RNG, A, P, U, VJ, C} <:
     # leap application
     counts::Vector{Int}
     du::U
-    changed_specs::SparseIndices
+    changed_specs::CS
     taus::Vector{T}
     stale_taus::SparseIndices
 end
 
 
 function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG},
-        policy, dt, epsilon, du, nmaj, vtoj, max_hor, max_stoich, self_stoch,
+        policy, tau, thin_negative, du, nmaj, vtoj, max_hor, max_stoich, self_stoch,
         crj_stoich, rates) where {T,S,F1,F2,RNG}
     n = length(du)
     njs = nmaj + (crj_stoich === nothing ? 0 : length(crj_stoich.net_stoch))
+    changed_specs = policy isa AlwaysLeap && crj_stoich !== nothing ?
+                    DenseIndices(n) : SparseIndices(n)
     HybridTauJumpAggregation{T, S, typeof(rates), F2, RNG, typeof(inner), typeof(policy),
-        typeof(du), typeof(vtoj), typeof(crj_stoich)}(
+        typeof(du), typeof(vtoj), typeof(crj_stoich), typeof(tau),
+        typeof(changed_specs)}(
         inner.next_jump,
         inner.prev_jump,
         inner.next_jump_time,
@@ -330,9 +364,9 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         inner,
         policy,
         crj_stoich,
-        convert(T, dt),
+        tau,
+        thin_negative,
         1e-10 * one(T),
-        convert(T, epsilon),
         -Inf * one(T),
         false,
         zeros(n),
@@ -349,7 +383,7 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         SparseIndices(njs),
         zeros(Int, njs),
         du,
-        SparseIndices(n),
+        changed_specs,
         fill(typemax(T), n),
         SparseIndices(n))
 end
@@ -388,8 +422,9 @@ function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_
     if vtoj === nothing && maj !== nothing && isempty(constant_jumps)
         vtoj = var_to_jumps_map(length(u), maj)
     end
-    HybridTauJumpAggregation(inner, aggregator.policy, aggregator.dt, aggregator.epsilon,
-        zero(u), nrx, vtoj, max_hor, max_stoich, selfs, crj_stoich, leap_rates)
+    HybridTauJumpAggregation(inner, aggregator.policy, aggregator.tau,
+        aggregator.thin_negative, zero(u), nrx, vtoj, max_hor, max_stoich, selfs,
+        crj_stoich, leap_rates)
 end
 
 # this is only needed because we're implementing the aggregator interface
@@ -453,19 +488,21 @@ leaps_everything(p) = p.policy isa AlwaysLeap && p.crj_stoich !== nothing
 
 function open_window!(p, integrator, u, params, t)
     refresh_rates!(p, u, params, t)
-    update_taus!(p, u, t, p.stale_taus)
-    τ = min(p.dt, max(minimum(p.taus), p.dtmin))
+    needs_moments(p.tau) && update_taus!(p, u, t, p.stale_taus)
+    τ = select_tau(p.tau, p)
     draw_leap!(p, τ)
-    while !feasible(u, p.du, p.changed_specs)
-        τ /= 2
-        if τ <= p.dtmin
-            fill!(p.du, zero(eltype(p.du)))
-            fill!(p.counts, 0)
-            empty!(p.changed_specs)
-            DiffEqBase.terminate!(integrator, ReturnCode.Failure)
-            break
+    if p.thin_negative
+        while !feasible(u, p.du, p.changed_specs)
+            τ /= 2
+            if τ <= p.dtmin
+                fill!(p.du, zero(eltype(p.du)))
+                fill!(p.counts, 0)
+                empty!(p.changed_specs)
+                DiffEqBase.terminate!(integrator, ReturnCode.Failure)
+                break
+            end
+            thin_leap!(p, 0.5)
         end
-        thin_leap!(p, 0.5)
     end
     @inbounds for i in p.changed_specs
         u[i] += p.du[i]
@@ -510,17 +547,20 @@ njumps(p) = length(p.rate)
 
 function compute_rates!(p, u, params, t)
     (; ma_jumps, crj_stoich, policy, leap_rate, rate, μ, σ², χ, self_stoch,
-       ulast, stale_taus) = p
-    fill!(μ, 0.0)
-    fill!(σ², 0.0)
-    fill!(χ, 0.0)
+       ulast, stale_taus, tau) = p
+    moments = needs_moments(tau)
+    if moments
+        fill!(μ, 0.0)
+        fill!(σ², 0.0)
+        fill!(χ, 0.0)
+    end
     @inbounds for j in 1:njumps(p)
         net_stoch = jump_stoich(ma_jumps, crj_stoich, j)
         a = jump_rate(p, ma_jumps, j, u, params, t)
         rate[j] = a
         leap_rate[j] = jump_leap_rate(policy, net_stoch,
             jump_order(ma_jumps, crj_stoich, j), u, a)
-        iszero(a) && continue
+        (moments && !iszero(a)) || continue
         for (spec, ν) in net_stoch
             μ[spec] += ν * a
             σ²[spec] += ν * ν * a
@@ -530,9 +570,11 @@ function compute_rates!(p, u, params, t)
         end
     end
     copyto!(ulast, u)
-    empty!(stale_taus)
-    @inbounds for i in eachindex(u)
-        push!(stale_taus, i)
+    if moments
+        empty!(stale_taus)
+        @inbounds for i in eachindex(u)
+            push!(stale_taus, i)
+        end
     end
     nothing
 end
@@ -540,12 +582,14 @@ end
 function refresh_rates!(p, u, params, t)
     p.vartojumps_map === nothing && return compute_rates!(p, u, params, t)
     (; ma_jumps, crj_stoich, policy, leap_rate, rate, μ, σ², χ, self_stoch,
-       ulast, stale_rxs, vartojumps_map, stale_taus, max_hor, max_stoich, epsilon) = p
+       ulast, stale_rxs, vartojumps_map, stale_taus, max_hor, max_stoich, tau) = p
     njs = njumps(p)
+    moments = needs_moments(tau)
+    epsilon = tau.epsilon
     empty!(stale_rxs)
     @inbounds for i in eachindex(u)
         u[i] == ulast[i] && continue
-        push!(stale_taus, i)
+        moments && push!(stale_taus, i)
         gi = effective_gi(u, max_hor, max_stoich, i)
         abs(u[i] - ulast[i]) <= 0.5 * epsilon * u[i] / gi && continue
         ulast[i] = u[i]
@@ -560,7 +604,7 @@ function refresh_rates!(p, u, params, t)
         rate[j] = a
         leap_rate[j] = jump_leap_rate(policy, net_stoch,
             jump_order(ma_jumps, crj_stoich, j), u, a)
-        iszero(d) && continue
+        (moments && !iszero(d)) || continue
         for (spec, ν) in net_stoch
             μ[spec] += ν * d
             σ²[spec] += ν * ν * d
@@ -595,7 +639,8 @@ function tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsi
 end
 
 function update_taus!(p, u, t, idxs)
-    (; taus, ulast, μ, σ², χ, max_hor, max_stoich, epsilon) = p
+    (; taus, ulast, μ, σ², χ, max_hor, max_stoich, tau) = p
+    epsilon = tau.epsilon
     @inbounds for i in idxs
         taus[i] = tau_for_species(u, ulast, μ, σ², χ, i, max_hor, max_stoich, t, epsilon)
     end

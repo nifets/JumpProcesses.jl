@@ -182,14 +182,17 @@ Ron Solan and Gad Getz, An exact tau-leaping method (2025). doi: 10.48550/arXiv.
 """
 struct TauSplitting <: AbstractAggregatorAlgorithm end
 
-struct HybridTau{A, B, T} <: AbstractAggregatorAlgorithm
+struct HybridTau{A, B, S} <: AbstractAggregatorAlgorithm
     exact::A
     policy::B
-    dt::T
-    epsilon::T
+    tau::S
+    thin_negative::Bool
 end
-HybridTau(exact, policy = CriticalBlend(10), dt = Inf; epsilon = 0.05) =
-    HybridTau(exact, policy, promote(dt, epsilon)...)
+HybridTau(exact, policy = CriticalBlend(10), dt = Inf; epsilon = 0.05,
+        thin_negative = true) =
+    HybridTau(exact, policy,
+        epsilon === nothing ? FixedTau(dt) : AdaptiveTau(promote(epsilon, dt)...),
+        thin_negative)
 
 # For JumpProblem construction without an aggregator
 struct NullAggregator <: AbstractAggregatorAlgorithm end
