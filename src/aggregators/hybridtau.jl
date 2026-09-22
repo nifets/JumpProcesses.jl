@@ -568,6 +568,11 @@ function open_window!(p, integrator, u, params, t)
     @inbounds for i in p.changed_specs
         u[i] += p.du[i]
     end
+    if !p.thin_negative
+        @inbounds for i in p.changed_specs
+            u[i] < zero(eltype(u)) && (u[i] = zero(eltype(u)))
+        end
+    end
     leaps_everything(p) || isempty(p.changed_specs) ||
         update_exact_rates!(p.exact, p, u, params, t)
     p.window_end = t + τ
