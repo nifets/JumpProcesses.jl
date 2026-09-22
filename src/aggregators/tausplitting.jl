@@ -536,8 +536,8 @@ end
     end
 
     crx = rx.idx - num_majumps
-    @inbounds p.urates[crx](p.ulow, p.uhigh, u, params, t) < rx.rate_high || return false
     lower_state!(p, rx) && return false
+    @inbounds p.urates[crx](p.ulow, p.uhigh, u, params, t) < rx.rate_high || return false
     @inbounds return rx.rate_low <= p.lrates[crx](p.ulow_rx, p.uhigh_rx, u, params, t)
 end
 
