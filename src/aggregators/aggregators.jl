@@ -234,7 +234,7 @@ needs_depgraph(aggregator::CCNRM) = true
 needs_depgraph(aggregator::RDirect) = true
 needs_depgraph(aggregator::Coevolve) = true
 needs_depgraph(aggregator::TauSplitting) = true
-needs_depgraph(aggregator::HybridTau) = true
+needs_depgraph(aggregator::HybridTau) = needs_depgraph(aggregator.exact)
 
 # true if aggregator requires a map from solution variable to dependent jumps.
 # It is implicitly assumed these aggregators also require the reverse map, from
