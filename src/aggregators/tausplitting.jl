@@ -86,7 +86,7 @@ Turn a left sibling node into a right sibling node due for processing
     nothing
 end
 
-mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, LU, U} <:
+mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, VJMAP, LU, U} <:
                AbstractSSAJumpAggregator{T, S, F1, F2, RNG}
     next_jump::Int     # not used
     prev_jump::Int     # not used
@@ -99,7 +99,6 @@ mutable struct TauSplittingJumpAggregation{T, S, F1, F2, RNG, DEPGR, VJMAP, LU, 
     affects!::F2       # not used
     save_positions::Tuple{Bool, Bool}
     rng::RNG
-    dep_gr::DEPGR
     jumptostoich_map::Vector{Vector{Pair{Int, Int}}}
     vartojumps_map::VJMAP
     spec_to_writer_rxs::Vector{Vector{Int}}
@@ -133,16 +132,6 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
 
     numspec = length(u)
     numrxs = get_num_majumps(maj) + length(rs)
-
-    if dep_graph === nothing
-        if (get_num_majumps(maj) == 0) || !isempty(rs)
-            error("To use ConstantRateJumps with the TauSplitting algorithm a dependency graph must be supplied.")
-        else
-            dg = make_dependency_graph(length(u), maj)
-        end
-    else
-        dg = dep_graph
-    end
 
     stochtype = Vector{Vector{Pair{Int, Int}}}
     if jumptostoich_map === nothing
@@ -221,7 +210,7 @@ function TauSplittingJumpAggregation(nj::Int, njt::T, et::T, crs::Nothing, sr::N
     reader_off[numrxs + 1] = length(reader_flat) + 1
 
     affecttype = F2 <: Tuple ? F2 : Any
-    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(dg), typeof(vtoj_map), typeof(lrates), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, dg, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, stoch_flat, stoch_off, react_flat, react_off, reader_flat, reader_off, lrates, urates, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
+    TauSplittingJumpAggregation{T, S, F1, affecttype, RNG, typeof(vtoj_map), typeof(lrates), U}(nj, nj, njt, et, crs, sr, maj, rs, affs!, sps, rng, jtos_map, vtoj_map, spec_to_writer_rxs, rx_to_reader_specs, stoch_flat, stoch_off, react_flat, react_off, reader_flat, reader_off, lrates, urates, njt, similar(u), similar(u), copy(u), copy(u), TauSplittingNode{T}[], zeros(Int, numspec), zeros(Int, numrxs), zeros(Int, numrxs), trues(numrxs), convert(T, max_interval))
 end
 
 function aggregate(aggregator::TauSplitting, u, p, t, end_time, constant_jumps,
@@ -370,8 +359,10 @@ function resample!(p::TauSplittingJumpAggregation, depth::Int, integrator, param
         active[i] = rx
         # if a reaction has more firings after resampling, reactivate its inactive dependents
         if rx.count > rxp.count
-            for dep in p.dep_gr[rx.idx]
-                reactivate!(p, dep, depth, integrator)
+            for (spec, _) in net_stoch(p, rx.idx)
+                for dep in p.vartojumps_map[spec]
+                    reactivate!(p, dep, depth, integrator)
+                end
             end
         end
         i += 1
