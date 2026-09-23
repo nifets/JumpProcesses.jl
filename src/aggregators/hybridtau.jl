@@ -246,7 +246,7 @@ nc_for(nc::AbstractVector, spec) = @inbounds float(nc[spec])
 
 function blend(policy::CriticalBlend, net_stoch, order, u)
     @inbounds for (spec, change) in net_stoch
-        change < 0 && u[spec] < nc_for(policy.nc, spec) * (-change) && return 1.0
+        u[spec] < nc_for(policy.nc, spec) * abs(change) && return 1.0
     end
     @inbounds for (spec, o) in order
         u[spec] < nc_for(policy.nc, spec) * o && return 1.0
@@ -259,8 +259,7 @@ function blend_thresholds(policy::CriticalBlend, maj, crj_stoich, njs, nspec,
     thr = [T[] for _ in 1:nspec]
     for j in 1:njs
         for (spec, change) in jump_stoich(maj, crj_stoich, j)
-            change < 0 &&
-                push!(thr[spec], ceil(T, nc_for(policy.nc, spec) * (-change)))
+            push!(thr[spec], ceil(T, nc_for(policy.nc, spec) * abs(change)))
         end
         for (spec, o) in jump_order(maj, crj_stoich, j)
             push!(thr[spec], ceil(T, nc_for(policy.nc, spec) * o))
