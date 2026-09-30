@@ -124,6 +124,9 @@ end
     β * evalrxrate(u, i, maj.inner)
 end
 
+@inline ma_blend(maj::BlendedMassActionJump, i, u) =
+    blend(maj.policy, maj.net_stoch[i], maj.reactant_stoch[i], u)
+
 @inline function get_majump_brackets(ulow, uhigh, k, maj::BlendedMassActionJump)
     alow, ahigh = get_majump_brackets(ulow, uhigh, k, maj.inner)
     net_stoch, order = maj.net_stoch[k], maj.reactant_stoch[k]
@@ -448,6 +451,24 @@ function HybridTauJumpAggregation(inner::AbstractSSAJumpAggregator{T,S,F1,F2,RNG
         SparseIndices(n))
 end
 
+blend_readers(::AlwaysLeap, vtoj, maj, crj_stoich, njs) = vtoj
+
+function blend_readers(policy, vtoj, maj, crj_stoich, njs)
+    vtoj = map(copy, vtoj)
+    for j in 1:njs, (spec, _) in jump_stoich(maj, crj_stoich, j)
+        j in vtoj[spec] || push!(vtoj[spec], j)
+    end
+    vtoj
+end
+
+blended_dependencies(exact, policy, maj, crj_stoich, njs, nspec, kw) = kw
+
+function blended_dependencies(::TauSplitting, policy, maj, crj_stoich, njs, nspec, kw)
+    base = get(kw, :vartojumps_map, nothing)
+    vtoj = base === nothing ? var_to_jumps_map(nspec, maj) : base
+    merge(kw, (; vartojumps_map = blend_readers(policy, vtoj, maj, crj_stoich, njs)))
+end
+
 function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_jumps,
         save_positions, rng; kwargs...)
     net_stoch = get(kwargs, :crj_stoich, nothing)
@@ -471,6 +492,9 @@ function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_
         kw = merge(kw, (; bracket_data = bd))
     end
 
+    kw = blended_dependencies(aggregator.exact, aggregator.policy, maj, crj_stoich, njs,
+        length(u), kw)
+
     leap_rates, _ = get_jump_info_fwrappers(u, p, t, constant_jumps)
     exact_jumps = (crj_stoich === nothing || constant_jumps === nothing ||
                    isempty(constant_jumps)) ? constant_jumps :
@@ -482,6 +506,7 @@ function aggregate(aggregator::HybridTau, u, p, t, end_time, constant_jumps, ma_
     if vtoj === nothing && maj !== nothing && isempty(constant_jumps)
         vtoj = var_to_jumps_map(length(u), maj)
     end
+    vtoj === nothing || (vtoj = blend_readers(aggregator.policy, vtoj, maj, crj_stoich, njs))
     HybridTauJumpAggregation(inner, aggregator.policy, aggregator.tau,
         aggregator.thin_negative, zero(u), nrx, vtoj, max_hor, max_stoich, selfs,
         crj_stoich, leap_rates)
@@ -497,6 +522,8 @@ function sync!(p::HybridTauJumpAggregation)
 end
 
 update_exact_rates!(exact::DirectJumpAggregation, p, u, params, t) = nothing
+
+update_exact_rates!(exact::TauSplittingJumpAggregation, p, u, params, t) = nothing
 
 update_exact_rates!(exact::RSSAJumpAggregation, p, u, params, t) =
     update_rates!(exact, u, params, t, p.changed_specs.idx)
@@ -585,11 +612,17 @@ function generate_jumps!(p::HybridTauJumpAggregation, integrator, u, params, t)
         return nothing
     end
     generate_jumps!(p.exact, integrator, u, params, t)
+    bound_exact!(p.exact, t, p.window_end)
     sync!(p)
     p.next_jump_time = min(p.exact.next_jump_time, p.window_end)
     p.exact_due = p.exact.next_jump_time <= p.window_end
     nothing
 end
+
+bound_exact!(exact, t, window_end) = nothing
+
+bound_exact!(exact::TauSplittingJumpAggregation, t, window_end) =
+    window_end > t && (exact.next_jump_time = min(exact.next_jump_time, window_end))
 
 function feasible(u, du, changed_specs)
     @inbounds for i in changed_specs

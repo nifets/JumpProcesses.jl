@@ -456,9 +456,11 @@ end
     @inbounds val * p.ma_jumps.scaled_rates[rxidx]
 end
 
+@inline ma_blend(maj, rxidx, u) = true
+
 @inline function jump_rate(p, rxidx, u, params, t)
     nummaj = get_num_majumps(p.ma_jumps)
-    rxidx <= nummaj && return ma_rate(p, rxidx, u)
+    rxidx <= nummaj && return ma_blend(p.ma_jumps, rxidx, u) * ma_rate(p, rxidx, u)
     @inbounds return p.rates[rxidx - nummaj](u, params, t)
 end
 
@@ -521,9 +523,10 @@ end
 @inline function is_stable(p::TauSplittingJumpAggregation, rx::ReactionEntry, u, params, t)
     num_majumps = get_num_majumps(p.ma_jumps)
     if rx.idx <= num_majumps
-        jump_rate(p, rx.idx, p.uhigh, params, t) < rx.rate_high || return false
+        ma_blend(p.ma_jumps, rx.idx, p.ulow) * ma_rate(p, rx.idx, p.uhigh) < rx.rate_high ||
+            return false
         lower_state!(p, rx) && return false
-        return rx.rate_low <= jump_rate(p, rx.idx, p.ulow_rx, params, t)
+        return rx.rate_low <= ma_blend(p.ma_jumps, rx.idx, p.uhigh_rx) * ma_rate(p, rx.idx, p.ulow_rx)
     end
 
     crx = rx.idx - num_majumps
